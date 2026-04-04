@@ -1,3 +1,4 @@
+import { getDefaultPromptTemplate } from "../prompt-template-definitions";
 import type {
   ApplicationTask,
   AppSettings,
@@ -147,6 +148,11 @@ export const createAppSettings = (
     },
     override: null,
   },
+  pdfRenderer: {
+    value: "rxresume",
+    default: "rxresume",
+    override: null,
+  },
   rxresumeBaseResumeId: null,
   rxresumeBaseResumeIdV4: null,
   rxresumeBaseResumeIdV5: null,
@@ -174,9 +180,24 @@ export const createAppSettings = (
     default: "",
     override: null,
   },
+  ghostwriterSystemPromptTemplate: {
+    value: getDefaultPromptTemplate("ghostwriterSystemPromptTemplate"),
+    default: getDefaultPromptTemplate("ghostwriterSystemPromptTemplate"),
+    override: null,
+  },
+  tailoringPromptTemplate: {
+    value: getDefaultPromptTemplate("tailoringPromptTemplate"),
+    default: getDefaultPromptTemplate("tailoringPromptTemplate"),
+    override: null,
+  },
+  scoringPromptTemplate: {
+    value: getDefaultPromptTemplate("scoringPromptTemplate"),
+    default: getDefaultPromptTemplate("scoringPromptTemplate"),
+    override: null,
+  },
   searchCities: {
-    value: "United Kingdom",
-    default: "United Kingdom",
+    value: "",
+    default: "",
     override: null,
   },
   jobspyResultsWanted: { value: 20, default: 20, override: null },
@@ -209,6 +230,8 @@ export const createAppSettings = (
     default: "english",
     override: null,
   },
+  chatStyleSummaryMaxWords: { value: null, default: null, override: null },
+  chatStyleMaxKeywordsPerSkill: { value: null, default: null, override: null },
   llmApiKeyHint: null,
   rxresumeApiKeyHint: null,
   rxresumeEmail: null,
