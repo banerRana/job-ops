@@ -1,9 +1,12 @@
 import { z } from "zod";
+import { getDefaultPromptTemplate } from "./prompt-template-definitions";
 import {
   CHAT_STYLE_LANGUAGE_MODE_VALUES,
   CHAT_STYLE_MANUAL_LANGUAGE_VALUES,
   type ChatStyleLanguageMode,
   type ChatStyleManualLanguage,
+  PDF_RENDERER_VALUES,
+  type PdfRenderer,
   type ResumeProjectsSettings,
 } from "./types/settings";
 
@@ -126,6 +129,7 @@ const parseChatStyleLanguageModeOrNull = createEnumParser(
 const parseChatStyleManualLanguageOrNull = createEnumParser(
   CHAT_STYLE_MANUAL_LANGUAGE_VALUES,
 );
+const parsePdfRendererOrNull = createEnumParser(PDF_RENDERER_VALUES);
 
 const WORKPLACE_TYPE_VALUES = ["remote", "hybrid", "onsite"] as const;
 const parseWorkplaceTypesOrNull = createEnumArrayParser(WORKPLACE_TYPE_VALUES);
@@ -233,20 +237,12 @@ export const settingsRegistry = {
       return value ? JSON.stringify(value) : null;
     },
   },
-  rxresumeMode: {
+  pdfRenderer: {
     kind: "typed" as const,
-    schema: z.enum(["v4", "v5"]),
-    default: (): "v4" | "v5" =>
-      (typeof process !== "undefined"
-        ? process.env.RXRESUME_MODE
-        : undefined) === "v4"
-        ? "v4"
-        : "v5",
-    parse: (raw: string | undefined): "v4" | "v5" | null => {
-      if (!raw) return null;
-      return raw === "v4" || raw === "v5" ? raw : null;
-    },
-    serialize: (value: "v4" | "v5" | null | undefined): string | null =>
+    schema: z.enum(PDF_RENDERER_VALUES),
+    default: (): PdfRenderer => "rxresume",
+    parse: parsePdfRendererOrNull,
+    serialize: (value: PdfRenderer | null | undefined): string | null =>
       value ?? null,
   },
   ukvisajobsMaxJobs: {
@@ -329,13 +325,38 @@ export const settingsRegistry = {
     serialize: (value: string | null | undefined): string | null =>
       value ?? null,
   },
+  ghostwriterSystemPromptTemplate: {
+    kind: "typed" as const,
+    schema: z.string().trim().max(12000),
+    default: (): string =>
+      getDefaultPromptTemplate("ghostwriterSystemPromptTemplate"),
+    parse: parseNonEmptyStringOrNull,
+    serialize: (value: string | null | undefined): string | null =>
+      value ?? null,
+  },
+  tailoringPromptTemplate: {
+    kind: "typed" as const,
+    schema: z.string().trim().max(12000),
+    default: (): string => getDefaultPromptTemplate("tailoringPromptTemplate"),
+    parse: parseNonEmptyStringOrNull,
+    serialize: (value: string | null | undefined): string | null =>
+      value ?? null,
+  },
+  scoringPromptTemplate: {
+    kind: "typed" as const,
+    schema: z.string().trim().max(12000),
+    default: (): string => getDefaultPromptTemplate("scoringPromptTemplate"),
+    parse: parseNonEmptyStringOrNull,
+    serialize: (value: string | null | undefined): string | null =>
+      value ?? null,
+  },
   searchCities: {
     kind: "typed" as const,
     schema: z.string().trim().max(100),
     default: (): string =>
       typeof process !== "undefined"
-        ? process.env.SEARCH_CITIES || process.env.JOBSPY_LOCATION || "UK"
-        : "UK",
+        ? process.env.SEARCH_CITIES || process.env.JOBSPY_LOCATION || ""
+        : "",
     parse: parseNonEmptyStringOrNull,
     serialize: (value: string | null | undefined): string | null =>
       value ?? null,
@@ -421,6 +442,20 @@ export const settingsRegistry = {
     parse: parseNonEmptyStringOrNull,
     serialize: (value: string | null | undefined): string | null =>
       value ?? null,
+  },
+  chatStyleSummaryMaxWords: {
+    kind: "typed" as const,
+    schema: z.number().int().min(1).max(500).nullable(),
+    default: (): number | null => null,
+    parse: parseIntOrNull,
+    serialize: serializeNullableNumber,
+  },
+  chatStyleMaxKeywordsPerSkill: {
+    kind: "typed" as const,
+    schema: z.number().int().min(1).max(50).nullable(),
+    default: (): number | null => null,
+    parse: parseIntOrNull,
+    serialize: serializeNullableNumber,
   },
   chatStyleLanguageMode: {
     kind: "typed" as const,
@@ -539,18 +574,9 @@ export const settingsRegistry = {
     kind: "string" as const,
     schema: z.string().trim().max(200),
   },
-  rxresumeBaseResumeIdV4: {
+  onboardingBasicAuthDecision: {
     kind: "string" as const,
-    schema: z.string().trim().max(200),
-  },
-  rxresumeBaseResumeIdV5: {
-    kind: "string" as const,
-    schema: z.string().trim().max(200),
-  },
-  rxresumeEmail: {
-    kind: "string" as const,
-    envKey: "RXRESUME_EMAIL",
-    schema: z.string().trim().max(200),
+    schema: z.enum(["enabled", "skipped"]),
   },
   rxresumeUrl: {
     kind: "string" as const,
@@ -580,11 +606,6 @@ export const settingsRegistry = {
   llmApiKey: {
     kind: "secret" as const,
     envKey: "LLM_API_KEY",
-    schema: z.string().trim().max(2000),
-  },
-  rxresumePassword: {
-    kind: "secret" as const,
-    envKey: "RXRESUME_PASSWORD",
     schema: z.string().trim().max(2000),
   },
   rxresumeApiKey: {

@@ -2,6 +2,12 @@ import { mkdtemp, rm } from "node:fs/promises";
 import type { Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { ExtractorRegistry } from "@server/extractors/registry";
+import {
+  type ExtractorSourceId,
+  PIPELINE_EXTRACTOR_SOURCE_IDS,
+} from "@shared/extractors";
+import type { ExtractorManifest } from "@shared/types";
 import { vi } from "vitest";
 
 vi.mock("@server/pipeline/index", () => {
@@ -82,7 +88,6 @@ vi.mock("@server/services/visa-sponsors/index", () => ({
 }));
 
 const originalEnv = { ...process.env };
-const originalFetch = global.fetch;
 const isolatedEnvKeys = [
   "RXRESUME_API_KEY",
   "RXRESUME_EMAIL",
@@ -94,12 +99,45 @@ const isolatedEnvKeys = [
   "LLM_BASE_URL",
   "BASIC_AUTH_USER",
   "BASIC_AUTH_PASSWORD",
+  "JWT_SECRET",
+  "JWT_EXPIRY_SECONDS",
   "WEBHOOK_SECRET",
   "UKVISAJOBS_EMAIL",
   "UKVISAJOBS_PASSWORD",
   "ADZUNA_APP_ID",
   "ADZUNA_APP_KEY",
 ] as const;
+
+const nativeFetch = globalThis.fetch;
+
+function createTestExtractorRegistry(): ExtractorRegistry {
+  const manifests = new Map<string, ExtractorManifest>();
+  const manifestBySource = new Map<ExtractorSourceId, ExtractorManifest>();
+
+  for (const source of PIPELINE_EXTRACTOR_SOURCE_IDS) {
+    const manifest: ExtractorManifest = {
+      id: `test-${source}`,
+      displayName: `Test ${source}`,
+      providesSources: [source],
+      run: vi.fn().mockResolvedValue({
+        success: true,
+        jobs: [],
+      }),
+    };
+    manifests.set(manifest.id, manifest);
+    manifestBySource.set(source, manifest);
+  }
+
+  return {
+    manifests,
+    manifestBySource,
+    availableSources: [...PIPELINE_EXTRACTOR_SOURCE_IDS],
+  };
+}
+
+function restoreNativeFetch(): void {
+  globalThis.fetch = nativeFetch;
+}
 
 export async function startServer(options?: {
   env?: Record<string, string | undefined>;
@@ -110,7 +148,7 @@ export async function startServer(options?: {
   tempDir: string;
 }> {
   vi.unstubAllGlobals();
-  global.fetch = originalFetch;
+  restoreNativeFetch();
   vi.resetModules();
   const tempDir = await mkdtemp(join(tmpdir(), "job-ops-api-test-"));
   const envOverrides = options?.env ?? {};
@@ -131,6 +169,17 @@ export async function startServer(options?: {
   const { applyStoredEnvOverrides } = await import(
     "@server/services/envSettings"
   );
+  const registryModule = await import("@server/extractors/registry");
+  const defaultRegistry = createTestExtractorRegistry();
+  if (vi.isMockFunction(registryModule.getExtractorRegistry)) {
+    vi.mocked(registryModule.getExtractorRegistry).mockResolvedValue(
+      defaultRegistry,
+    );
+  } else {
+    vi.spyOn(registryModule, "getExtractorRegistry").mockResolvedValue(
+      defaultRegistry,
+    );
+  }
   const { createApp } = await import("../../app");
   const { closeDb } = await import("@server/db/index");
   const { getPipelineStatus } = await import("@server/pipeline/index");
@@ -172,6 +221,6 @@ export async function stopServer(args: {
   }
   process.env = { ...originalEnv };
   vi.unstubAllGlobals();
-  global.fetch = originalFetch;
+  restoreNativeFetch();
   vi.clearAllMocks();
 }

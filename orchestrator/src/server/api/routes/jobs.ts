@@ -1,12 +1,15 @@
+import { rm } from "node:fs/promises";
 import {
   AppError,
   type AppErrorCode,
   badRequest,
   conflict,
   notFound,
+  toAppError,
 } from "@infra/errors";
 import { fail, ok, okWithMeta } from "@infra/http";
 import { logger } from "@infra/logger";
+import { trackServerProductEvent } from "@infra/product-analytics";
 import { sanitizeWebhookPayload } from "@infra/sanitize";
 import { setupSse, startSseHeartbeat, writeSseData } from "@infra/sse";
 import { isDemoMode, sendDemoBlocked } from "@server/config/demo";
@@ -25,6 +28,7 @@ import {
   transitionStage,
   updateStageEvent,
 } from "@server/services/applicationTracking";
+import { attachAppliedDuplicateMatches } from "@server/services/applied-duplicate-matching";
 import {
   simulateApplyJob,
   simulateGeneratePdf,
@@ -32,6 +36,7 @@ import {
   simulateRescoreJob,
   simulateSummarizeJob,
 } from "@server/services/demo-simulator";
+import { uploadJobPdf } from "@server/services/job-pdf-upload";
 import { getProfile } from "@server/services/profile";
 import { scoreJobSuitability } from "@server/services/scorer";
 import { getTracerReadiness } from "@server/services/tracer-links";
@@ -62,6 +67,11 @@ const tailoredSkillsPayloadSchema = z.array(
     keywords: z.array(z.string()),
   }),
 );
+
+const jobNoteSchema = z.object({
+  title: z.string().trim().min(1).max(120),
+  content: z.string().trim().min(1).max(20000),
+});
 
 async function notifyJobCompleteWebhook(job: Job) {
   const overrideWebhookUrl = await settingsRepo.getSetting(
@@ -230,10 +240,19 @@ const jobsRevisionQuerySchema = z.object({
   status: z.string().optional(),
 });
 
+const uploadJobPdfSchema = z.object({
+  fileName: z.string().trim().min(1).max(255),
+  mediaType: z.string().trim().min(1).max(200).optional(),
+  dataBase64: z.string().trim().min(1),
+});
+
 const SKIPPABLE_STATUSES: ReadonlySet<JobStatus> = new Set([
   "discovered",
   "ready",
 ]);
+const JOBS_BENCHMARK_ENABLED =
+  process.env.BENCHMARK_JOBS_TIMING === "1" ||
+  process.env.BENCHMARK_JOBS_TIMING === "true";
 
 function parseStatusFilter(statusFilter?: string): JobStatus[] | undefined {
   const parsed = statusFilter?.split(",").filter(Boolean) as
@@ -302,6 +321,11 @@ type JobActionExecutionOptions = {
   getProfileForRescore?: () => Promise<Record<string, unknown>>;
   forceMoveToReady?: boolean;
   requestOrigin?: string | null;
+  analyticsOrigin?:
+    | "move_to_ready"
+    | "generate_pdf"
+    | "pipeline"
+    | "manual_job_create";
 };
 
 function createSharedRescoreProfileLoader(): () => Promise<
@@ -390,6 +414,7 @@ async function executeJobActionForJob(
         const processed = await processJob(jobId, {
           force: options?.forceMoveToReady ?? false,
           requestOrigin: options?.requestOrigin ?? null,
+          analyticsOrigin: options?.analyticsOrigin ?? "move_to_ready",
         });
         if (!processed.success) {
           throw new AppError({
@@ -499,7 +524,17 @@ function mapJobActionFailure(
  */
 jobsRouter.get("/", async (req: Request, res: Response) => {
   try {
+    const benchmarkStart = performance.now();
+    let queryParseMs = 0;
+    let primaryQueryMs = 0;
+    const duplicateCandidatesQueryMs = 0;
+    const duplicateMatchCpuMs = 0;
+    let statsAggregateMs = 0;
+    let revisionAggregateMs = 0;
+
+    const queryParseStart = performance.now();
     const parsedQuery = listJobsQuerySchema.safeParse(req.query);
+    queryParseMs = performance.now() - queryParseStart;
     if (!parsedQuery.success) {
       return fail(
         res,
@@ -514,12 +549,20 @@ jobsRouter.get("/", async (req: Request, res: Response) => {
     const statuses = parseStatusFilter(statusFilter);
     const view = parsedQuery.data.view ?? "list";
 
+    const primaryQueryStart = performance.now();
     const jobs: Array<Job | JobListItem> =
       view === "list"
         ? await jobsRepo.getJobListItems(statuses)
         : await jobsRepo.getAllJobs(statuses);
+    primaryQueryMs = performance.now() - primaryQueryStart;
+    const candidateCount = 0;
+    const duplicateMatchingEnabled = false;
+    const statsAggregateStart = performance.now();
     const stats = await jobsRepo.getJobStats();
+    statsAggregateMs = performance.now() - statsAggregateStart;
+    const revisionAggregateStart = performance.now();
     const revision = await jobsRepo.getJobsRevision(statuses);
+    revisionAggregateMs = performance.now() - revisionAggregateStart;
 
     const response: JobsListResponse<Job | JobListItem> = {
       jobs,
@@ -527,6 +570,33 @@ jobsRouter.get("/", async (req: Request, res: Response) => {
       byStatus: stats,
       revision: revision.revision,
     };
+    const internalRouteMs =
+      queryParseMs +
+      primaryQueryMs +
+      duplicateCandidatesQueryMs +
+      duplicateMatchCpuMs +
+      statsAggregateMs +
+      revisionAggregateMs;
+    const totalMs = performance.now() - benchmarkStart;
+
+    if (JOBS_BENCHMARK_ENABLED) {
+      logger.info("Jobs list benchmark", {
+        route: "GET /api/jobs",
+        view,
+        statusFilter: statusFilter ?? null,
+        returnedCount: jobs.length,
+        duplicateMatchingEnabled,
+        candidateCount,
+        totalMs,
+        queryParseMs,
+        primaryQueryMs,
+        duplicateCandidatesQueryMs,
+        duplicateMatchCpuMs,
+        statsAggregateMs,
+        revisionAggregateMs,
+        internalRouteMs,
+      });
+    }
 
     logger.info("Jobs list fetched", {
       route: "GET /api/jobs",
@@ -887,10 +957,13 @@ jobsRouter.get("/:id", async (req: Request, res: Response) => {
     if (!job) {
       return fail(res, notFound("Job not found"));
     }
-    res.json({ success: true, data: job });
+    const [jobWithAppliedDuplicateMatch] = attachAppliedDuplicateMatches(
+      [job],
+      await jobsRepo.getAppliedDuplicateMatchCandidates(),
+    );
+    ok(res, jobWithAppliedDuplicateMatch);
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown error";
-    res.status(500).json({ success: false, error: message });
+    fail(res, toAppError(error));
   }
 });
 
@@ -900,10 +973,243 @@ jobsRouter.get("/:id", async (req: Request, res: Response) => {
 jobsRouter.get("/:id/events", async (req: Request, res: Response) => {
   try {
     const events = await getStageEvents(req.params.id);
-    res.json({ success: true, data: events });
+    ok(res, events);
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown error";
-    res.status(500).json({ success: false, error: message });
+    fail(res, toAppError(error));
+  }
+});
+
+/**
+ * GET /api/jobs/:id/notes - Get notes for a job
+ */
+jobsRouter.get("/:id/notes", async (req: Request, res: Response) => {
+  const requestId = String(res.getHeader("x-request-id") || "unknown");
+
+  try {
+    const job = await jobsRepo.getJobById(req.params.id);
+    if (!job) {
+      const err = notFound("Job not found");
+      logger.warn("Job notes fetch failed", {
+        route: "GET /api/jobs/:id/notes",
+        jobId: req.params.id,
+        requestId,
+        status: err.status,
+        code: err.code,
+      });
+      return fail(res, err);
+    }
+
+    const notes = await jobsRepo.listJobNotes(job.id);
+
+    logger.info("Job notes fetched", {
+      route: "GET /api/jobs/:id/notes",
+      jobId: job.id,
+      requestId,
+      returnedCount: notes.length,
+    });
+
+    ok(res, notes);
+  } catch (error) {
+    const err = toAppError(error);
+    logger.error("Job notes fetch failed", {
+      route: "GET /api/jobs/:id/notes",
+      jobId: req.params.id,
+      requestId,
+      status: err.status,
+      code: err.code,
+      details: err.details,
+      errorMessage: error instanceof Error ? error.message : undefined,
+    });
+    fail(res, err);
+  }
+});
+
+/**
+ * POST /api/jobs/:id/notes - Create a note for a job
+ */
+jobsRouter.post("/:id/notes", async (req: Request, res: Response) => {
+  const requestId = String(res.getHeader("x-request-id") || "unknown");
+
+  try {
+    const input = jobNoteSchema.safeParse(req.body);
+    if (!input.success) {
+      return fail(
+        res,
+        badRequest("Invalid job note request", input.error.flatten()),
+      );
+    }
+
+    const job = await jobsRepo.getJobById(req.params.id);
+    if (!job) {
+      const err = notFound("Job not found");
+      logger.warn("Job note create failed", {
+        route: "POST /api/jobs/:id/notes",
+        jobId: req.params.id,
+        requestId,
+        status: err.status,
+        code: err.code,
+      });
+      return fail(res, err);
+    }
+
+    const note = await jobsRepo.createJobNote({
+      jobId: job.id,
+      ...input.data,
+    });
+
+    logger.info("Job note created", {
+      route: "POST /api/jobs/:id/notes",
+      jobId: job.id,
+      noteId: note.id,
+      requestId,
+    });
+
+    ok(res, note, 201);
+  } catch (error) {
+    const err = toAppError(error);
+    logger.error("Job note create failed", {
+      route: "POST /api/jobs/:id/notes",
+      jobId: req.params.id,
+      requestId,
+      status: err.status,
+      code: err.code,
+      details: err.details,
+      errorMessage: error instanceof Error ? error.message : undefined,
+    });
+    fail(res, err);
+  }
+});
+
+/**
+ * PATCH /api/jobs/:id/notes/:noteId - Update a job note
+ */
+jobsRouter.patch("/:id/notes/:noteId", async (req: Request, res: Response) => {
+  const requestId = String(res.getHeader("x-request-id") || "unknown");
+
+  try {
+    const input = jobNoteSchema.safeParse(req.body);
+    if (!input.success) {
+      return fail(
+        res,
+        badRequest("Invalid job note request", input.error.flatten()),
+      );
+    }
+
+    const job = await jobsRepo.getJobById(req.params.id);
+    if (!job) {
+      const err = notFound("Job not found");
+      logger.warn("Job note update failed", {
+        route: "PATCH /api/jobs/:id/notes/:noteId",
+        jobId: req.params.id,
+        noteId: req.params.noteId,
+        requestId,
+        status: err.status,
+        code: err.code,
+      });
+      return fail(res, err);
+    }
+
+    const note = await jobsRepo.updateJobNote({
+      jobId: job.id,
+      noteId: req.params.noteId,
+      ...input.data,
+    });
+    if (!note) {
+      const err = notFound("Job note not found");
+      logger.warn("Job note update failed", {
+        route: "PATCH /api/jobs/:id/notes/:noteId",
+        jobId: job.id,
+        noteId: req.params.noteId,
+        requestId,
+        status: err.status,
+        code: err.code,
+      });
+      return fail(res, err);
+    }
+
+    logger.info("Job note updated", {
+      route: "PATCH /api/jobs/:id/notes/:noteId",
+      jobId: job.id,
+      noteId: note.id,
+      requestId,
+    });
+
+    ok(res, note);
+  } catch (error) {
+    const err = toAppError(error);
+    logger.error("Job note update failed", {
+      route: "PATCH /api/jobs/:id/notes/:noteId",
+      jobId: req.params.id,
+      noteId: req.params.noteId,
+      requestId,
+      status: err.status,
+      code: err.code,
+      details: err.details,
+      errorMessage: error instanceof Error ? error.message : undefined,
+    });
+    fail(res, err);
+  }
+});
+
+/**
+ * DELETE /api/jobs/:id/notes/:noteId - Delete a job note
+ */
+jobsRouter.delete("/:id/notes/:noteId", async (req: Request, res: Response) => {
+  const requestId = String(res.getHeader("x-request-id") || "unknown");
+
+  try {
+    const job = await jobsRepo.getJobById(req.params.id);
+    if (!job) {
+      const err = notFound("Job not found");
+      logger.warn("Job note delete failed", {
+        route: "DELETE /api/jobs/:id/notes/:noteId",
+        jobId: req.params.id,
+        noteId: req.params.noteId,
+        requestId,
+        status: err.status,
+        code: err.code,
+      });
+      return fail(res, err);
+    }
+
+    const deletedCount = await jobsRepo.deleteJobNote({
+      jobId: job.id,
+      noteId: req.params.noteId,
+    });
+    if (deletedCount === 0) {
+      const err = notFound("Job note not found");
+      logger.warn("Job note delete failed", {
+        route: "DELETE /api/jobs/:id/notes/:noteId",
+        jobId: job.id,
+        noteId: req.params.noteId,
+        requestId,
+        status: err.status,
+        code: err.code,
+      });
+      return fail(res, err);
+    }
+
+    logger.info("Job note deleted", {
+      route: "DELETE /api/jobs/:id/notes/:noteId",
+      jobId: job.id,
+      noteId: req.params.noteId,
+      requestId,
+    });
+
+    ok(res, null);
+  } catch (error) {
+    const err = toAppError(error);
+    logger.error("Job note delete failed", {
+      route: "DELETE /api/jobs/:id/notes/:noteId",
+      jobId: req.params.id,
+      noteId: req.params.noteId,
+      requestId,
+      status: err.status,
+      code: err.code,
+      details: err.details,
+      errorMessage: error instanceof Error ? error.message : undefined,
+    });
+    fail(res, err);
   }
 });
 
@@ -916,10 +1222,9 @@ jobsRouter.get("/:id/tasks", async (req: Request, res: Response) => {
       req.query.includeCompleted === "1" ||
       req.query.includeCompleted === "true";
     const tasks = await getTasks(req.params.id, includeCompleted);
-    res.json({ success: true, data: tasks });
+    ok(res, tasks);
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown error";
-    res.status(500).json({ success: false, error: message });
+    fail(res, toAppError(error));
   }
 });
 
@@ -936,13 +1241,12 @@ jobsRouter.post("/:id/stages", async (req: Request, res: Response) => {
       input.metadata ?? null,
       input.outcome ?? null,
     );
-    res.json({ success: true, data: event });
+    ok(res, event);
   } catch (error) {
     if (error instanceof z.ZodError) {
-      return res.status(400).json({ success: false, error: error.message });
+      return fail(res, badRequest(error.message, error.flatten()));
     }
-    const message = error instanceof Error ? error.message : "Unknown error";
-    res.status(500).json({ success: false, error: message });
+    fail(res, toAppError(error));
   }
 });
 
@@ -955,13 +1259,12 @@ jobsRouter.patch(
     try {
       const input = updateStageEventSchema.parse(req.body);
       updateStageEvent(req.params.eventId, input);
-      res.json({ success: true });
+      ok(res, null);
     } catch (error) {
       if (error instanceof z.ZodError) {
-        return res.status(400).json({ success: false, error: error.message });
+        return fail(res, badRequest(error.message, error.flatten()));
       }
-      const message = error instanceof Error ? error.message : "Unknown error";
-      res.status(500).json({ success: false, error: message });
+      fail(res, toAppError(error));
     }
   },
 );
@@ -974,10 +1277,9 @@ jobsRouter.delete(
   async (req: Request, res: Response) => {
     try {
       deleteStageEvent(req.params.eventId);
-      res.json({ success: true });
+      ok(res, null);
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Unknown error";
-      res.status(500).json({ success: false, error: message });
+      fail(res, toAppError(error));
     }
   },
 );
@@ -1000,13 +1302,12 @@ jobsRouter.patch("/:id/outcome", async (req: Request, res: Response) => {
       return fail(res, notFound("Job not found"));
     }
 
-    res.json({ success: true, data: job });
+    ok(res, job);
   } catch (error) {
     if (error instanceof z.ZodError) {
-      return res.status(400).json({ success: false, error: error.message });
+      return fail(res, badRequest(error.message, error.flatten()));
     }
-    const message = error instanceof Error ? error.message : "Unknown error";
-    res.status(500).json({ success: false, error: message });
+    fail(res, toAppError(error));
   }
 });
 
@@ -1112,6 +1413,111 @@ jobsRouter.patch("/:id", async (req: Request, res: Response) => {
   }
 });
 
+jobsRouter.post("/:id/pdf", async (req: Request, res: Response) => {
+  let uploadedPath: string | null = null;
+
+  try {
+    const input = uploadJobPdfSchema.parse(req.body);
+    const currentJob = await jobsRepo.getJobById(req.params.id);
+
+    if (!currentJob) {
+      const err = new AppError({
+        status: 404,
+        code: "NOT_FOUND",
+        message: "Job not found",
+      });
+      logger.warn("Job PDF upload failed", {
+        route: "POST /api/jobs/:id/pdf",
+        jobId: req.params.id,
+        status: err.status,
+        code: err.code,
+      });
+      fail(res, err);
+      return;
+    }
+
+    const uploaded = await uploadJobPdf({
+      jobId: req.params.id,
+      fileName: input.fileName,
+      mediaType: input.mediaType,
+      dataBase64: input.dataBase64,
+    });
+    uploadedPath = uploaded.outputPath;
+
+    const job = await jobsRepo.updateJob(req.params.id, {
+      pdfPath: uploaded.outputPath,
+    });
+
+    if (!job) {
+      await rm(uploaded.outputPath, { force: true }).catch((cleanupError) => {
+        logger.warn("Failed to clean up uploaded PDF after missing job", {
+          route: "POST /api/jobs/:id/pdf",
+          jobId: req.params.id,
+          cleanupError,
+        });
+      });
+
+      const err = new AppError({
+        status: 404,
+        code: "NOT_FOUND",
+        message: "Job not found",
+      });
+      logger.warn("Job PDF upload failed", {
+        route: "POST /api/jobs/:id/pdf",
+        jobId: req.params.id,
+        status: err.status,
+        code: err.code,
+      });
+      fail(res, err);
+      return;
+    }
+
+    logger.info("Job PDF uploaded", {
+      route: "POST /api/jobs/:id/pdf",
+      jobId: req.params.id,
+      fileName: input.fileName,
+      byteLength: uploaded.byteLength,
+    });
+
+    ok(res, job, 201);
+  } catch (error) {
+    const err =
+      error instanceof z.ZodError
+        ? badRequest(
+            error.issues[0]?.message ?? "Invalid job PDF upload request",
+            error.flatten(),
+          )
+        : error instanceof AppError
+          ? error
+          : new AppError({
+              status: 500,
+              code: "INTERNAL_ERROR",
+              message: error instanceof Error ? error.message : "Unknown error",
+            });
+
+    if (uploadedPath) {
+      await rm(uploadedPath, { force: true }).catch((cleanupError) => {
+        logger.warn("Failed to clean up uploaded PDF after route error", {
+          route: "POST /api/jobs/:id/pdf",
+          jobId: req.params.id,
+          cleanupError,
+        });
+      });
+    }
+
+    logger.error("Job PDF upload failed", {
+      route: "POST /api/jobs/:id/pdf",
+      jobId: req.params.id,
+      status: err.status,
+      code: err.code,
+      details: err.details,
+      uploadedPath,
+    });
+
+    fail(res, err);
+  }
+});
+
 /**
  * POST /api/jobs/:id/summarize - Generate AI summary and suggest projects
  */
@@ -1123,7 +1529,10 @@ jobsRouter.post("/:id/summarize", async (req: Request, res: Response) => {
     if (isDemoMode()) {
       const result = await simulateSummarizeJob(req.params.id, { force });
       if (!result.success) {
-        return res.status(400).json({ success: false, error: result.error });
+        return fail(
+          res,
+          badRequest(result.error ?? "Failed to summarize the job"),
+        );
       }
       const job = await jobsRepo.getJobById(req.params.id);
       if (!job) {
@@ -1135,14 +1544,19 @@ jobsRouter.post("/:id/summarize", async (req: Request, res: Response) => {
     const result = await summarizeJob(req.params.id, { force });
 
     if (!result.success) {
-      return res.status(400).json({ success: false, error: result.error });
+      return fail(
+        res,
+        badRequest(result.error ?? "Failed to summarize the job"),
+      );
     }
 
     const job = await jobsRepo.getJobById(req.params.id);
-    res.json({ success: true, data: job });
+    if (!job) {
+      return fail(res, notFound("Job not found"));
+    }
+    ok(res, job);
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown error";
-    res.status(500).json({ success: false, error: message });
+    fail(res, toAppError(error));
   }
 });
 
@@ -1158,9 +1572,7 @@ jobsRouter.post("/:id/check-sponsor", async (req: Request, res: Response) => {
     }
 
     if (!job.employer) {
-      return res
-        .status(400)
-        .json({ success: false, error: "Job has no employer name" });
+      return fail(res, badRequest("Job has no employer name"));
     }
 
     // Search for sponsor matches
@@ -1178,17 +1590,33 @@ jobsRouter.post("/:id/check-sponsor", async (req: Request, res: Response) => {
       sponsorMatchNames: sponsorMatchNames ?? undefined,
     });
 
-    res.json({
-      success: true,
-      data: updatedJob,
+    if (!updatedJob) {
+      return fail(res, notFound("Job not found"));
+    }
+
+    if (sponsorMatchScore >= 50 && sponsorResults.length > 0) {
+      void trackServerProductEvent(
+        "sponsor_match_found",
+        {
+          match_score: sponsorMatchScore,
+          match_count: sponsorResults.length,
+        },
+        {
+          requestOrigin: resolveRequestOrigin(req),
+          urlPath: "/visa-sponsors",
+        },
+      );
+    }
+
+    ok(res, {
+      ...updatedJob,
       matchResults: sponsorResults.slice(0, 5).map((r) => ({
         name: r.sponsor.organisationName,
         score: r.score,
       })),
     });
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown error";
-    res.status(500).json({ success: false, error: message });
+    fail(res, toAppError(error));
   }
 });
 
@@ -1200,7 +1628,10 @@ jobsRouter.post("/:id/generate-pdf", async (req: Request, res: Response) => {
     if (isDemoMode()) {
       const result = await simulateGeneratePdf(req.params.id);
       if (!result.success) {
-        return res.status(400).json({ success: false, error: result.error });
+        return fail(
+          res,
+          badRequest(result.error ?? "Failed to generate a resume PDF"),
+        );
       }
       const job = await jobsRepo.getJobById(req.params.id);
       if (!job) {
@@ -1211,17 +1642,23 @@ jobsRouter.post("/:id/generate-pdf", async (req: Request, res: Response) => {
 
     const result = await generateFinalPdf(req.params.id, {
       requestOrigin: resolveRequestOrigin(req),
+      analyticsOrigin: "generate_pdf",
     });
 
     if (!result.success) {
-      return res.status(400).json({ success: false, error: result.error });
+      return fail(
+        res,
+        badRequest(result.error ?? "Failed to generate a resume PDF"),
+      );
     }
 
     const job = await jobsRepo.getJobById(req.params.id);
-    res.json({ success: true, data: job });
+    if (!job) {
+      return fail(res, notFound("Job not found"));
+    }
+    ok(res, job);
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown error";
-    res.status(500).json({ success: false, error: message });
+    fail(res, toAppError(error));
   }
 });
 
@@ -1261,6 +1698,21 @@ jobsRouter.post("/:id/apply", async (req: Request, res: Response) => {
     });
 
     if (updatedJob) {
+      void trackServerProductEvent(
+        "application_marked_applied",
+        {
+          source: "jobs_apply_route",
+          had_pdf: Boolean(updatedJob.pdfPath),
+          tracer_links_enabled: Boolean(updatedJob.tracerLinksEnabled),
+          sponsor_match_found:
+            typeof updatedJob.sponsorMatchScore === "number" &&
+            updatedJob.sponsorMatchScore >= 50,
+        },
+        {
+          requestOrigin: resolveRequestOrigin(req),
+          urlPath: "/jobs",
+        },
+      );
       notifyJobCompleteWebhook(updatedJob).catch((error) => {
         logger.warn("Job complete webhook dispatch failed", error);
       });
@@ -1270,10 +1722,9 @@ jobsRouter.post("/:id/apply", async (req: Request, res: Response) => {
       return fail(res, notFound("Job not found"));
     }
 
-    res.json({ success: true, data: updatedJob });
+    ok(res, updatedJob);
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown error";
-    res.status(500).json({ success: false, error: message });
+    fail(res, toAppError(error));
   }
 });
 
@@ -1293,16 +1744,12 @@ jobsRouter.delete("/status/:status", async (req: Request, res: Response) => {
     const status = req.params.status as JobStatus;
     const count = await jobsRepo.deleteJobsByStatus(status);
 
-    res.json({
-      success: true,
-      data: {
-        message: `Cleared ${count} ${status} jobs`,
-        count,
-      },
+    ok(res, {
+      message: `Cleared ${count} ${status} jobs`,
+      count,
     });
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown error";
-    res.status(500).json({ success: false, error: message });
+    fail(res, toAppError(error));
   }
 });
 
@@ -1324,38 +1771,20 @@ jobsRouter.delete("/score/:threshold", async (req: Request, res: Response) => {
 
     const threshold = parseInt(req.params.threshold, 10);
     if (Number.isNaN(threshold) || threshold < 0 || threshold > 100) {
-      return res.status(400).json({
-        ok: false,
-        error: {
-          code: "INVALID_REQUEST",
-          message: "Threshold must be a number between 0 and 100",
-        },
-        meta: {
-          requestId: (req.headers["x-request-id"] as string) || "unknown",
-        },
-      });
+      return fail(
+        res,
+        badRequest("Threshold must be a number between 0 and 100"),
+      );
     }
 
     const count = await jobsRepo.deleteJobsBelowScore(threshold);
 
-    res.json({
-      ok: true,
-      data: {
-        message: `Cleared ${count} jobs with score below ${threshold}`,
-        count,
-        threshold,
-      },
-      meta: { requestId: (req.headers["x-request-id"] as string) || "unknown" },
+    ok(res, {
+      message: `Cleared ${count} jobs with score below ${threshold}`,
+      count,
+      threshold,
     });
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown error";
-    res.status(500).json({
-      ok: false,
-      error: {
-        code: "INTERNAL_ERROR",
-        message,
-      },
-      meta: { requestId: (req.headers["x-request-id"] as string) || "unknown" },
-    });
+    fail(res, toAppError(error));
   }
 });

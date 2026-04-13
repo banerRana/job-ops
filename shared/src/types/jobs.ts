@@ -117,7 +117,26 @@ export interface Interview {
   outcome: InterviewOutcome | null;
 }
 
+export interface JobNote {
+  id: string;
+  jobId: string;
+  title: string;
+  content: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export type JobSource = ExtractorSourceId;
+
+export interface AppliedDuplicateMatch {
+  jobId: string;
+  title: string;
+  employer: string;
+  appliedAt: string;
+  score: number;
+  titleScore: number;
+  employerScore: number;
+}
 
 export interface Job {
   id: string;
@@ -156,6 +175,7 @@ export interface Job {
   tracerLinksEnabled: boolean; // Rewrite outbound resume links to tracer links on next PDF generation
   sponsorMatchScore: number | null; // 0-100 fuzzy match score with visa sponsors
   sponsorMatchNames: string | null; // JSON array of matched sponsor names (when 100% matches or top match)
+  appliedDuplicateMatch?: AppliedDuplicateMatch | null; // Included on detail responses and may be omitted on list responses
 
   // JobSpy fields (nullable for non-JobSpy sources)
   jobType: string | null;
@@ -186,6 +206,7 @@ export interface Job {
   // Timestamps
   discoveredAt: string;
   processedAt: string | null;
+  readyAt: string | null;
   appliedAt: string | null;
   createdAt: string;
   updatedAt: string;
@@ -208,12 +229,14 @@ export type JobListItem = Pick<
   | "closedAt"
   | "suitabilityScore"
   | "sponsorMatchScore"
+  | "appliedDuplicateMatch"
   | "jobType"
   | "jobFunction"
   | "salaryMinAmount"
   | "salaryMaxAmount"
   | "salaryCurrency"
   | "discoveredAt"
+  | "readyAt"
   | "appliedAt"
   | "updatedAt"
 >;
@@ -310,7 +333,18 @@ export interface UpdateJobInput {
   selectedProjectIds?: string;
   pdfPath?: string;
   tracerLinksEnabled?: boolean;
+  readyAt?: string;
   appliedAt?: string;
   sponsorMatchScore?: number;
   sponsorMatchNames?: string;
+}
+
+export interface CreateJobNoteInput {
+  title: string;
+  content: string;
+}
+
+export interface UpdateJobNoteInput {
+  title: string;
+  content: string;
 }

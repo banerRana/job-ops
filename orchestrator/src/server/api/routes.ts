@@ -3,9 +3,12 @@
  */
 
 import { Router } from "express";
+import { authRouter } from "./routes/auth";
 import { backupRouter } from "./routes/backup";
 import { databaseRouter } from "./routes/database";
 import { demoRouter } from "./routes/demo";
+import { designResumeRouter } from "./routes/design-resume";
+import { extractorHealthRouter } from "./routes/extractor-health";
 import { ghostwriterRouter } from "./routes/ghostwriter";
 import { jobsRouter } from "./routes/jobs";
 import { manualJobsRouter } from "./routes/manual-jobs";
@@ -32,7 +35,10 @@ apiRouter.use("/manual-jobs", manualJobsRouter);
 apiRouter.use("/webhook", webhookRouter);
 apiRouter.use("/profile", profileRouter);
 apiRouter.use("/database", databaseRouter);
+apiRouter.use("/design-resume", designResumeRouter);
 apiRouter.use("/visa-sponsors", visaSponsorsRouter);
 apiRouter.use("/onboarding", onboardingRouter);
 apiRouter.use("/backups", backupRouter);
 apiRouter.use("/tracer-links", tracerLinksRouter);
+apiRouter.use("/auth", authRouter);
+apiRouter.use("/", extractorHealthRouter);

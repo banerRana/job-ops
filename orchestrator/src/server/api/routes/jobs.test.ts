@@ -1,4 +1,6 @@
+import { readFile } from "node:fs/promises";
 import type { Server } from "node:http";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { startServer, stopServer } from "./test-utils";
 
@@ -57,6 +59,7 @@ describe.sequential("Jobs API routes", () => {
     expect(listBody.data.jobs[0].id).toBeTruthy();
     expect(listBody.data.jobs[0].title).toBe("List View Role");
     expect(listBody.data.jobs[0]).not.toHaveProperty("jobDescription");
+    expect(listBody.data.jobs[0]).not.toHaveProperty("appliedDuplicateMatch");
     expect(typeof listBody.data.revision).toBe("string");
 
     const fullRes = await fetch(`${baseUrl}/api/jobs?view=full`);
@@ -65,6 +68,7 @@ describe.sequential("Jobs API routes", () => {
     expect(fullBody.ok).toBe(true);
     expect(fullBody.data.jobs[0].title).toBe("List View Role");
     expect(fullBody.data.jobs[0]).toHaveProperty("jobDescription");
+    expect(fullBody.data.jobs[0]).not.toHaveProperty("appliedDuplicateMatch");
     expect(typeof fullBody.data.revision).toBe("string");
 
     const defaultRes = await fetch(`${baseUrl}/api/jobs`);
@@ -72,7 +76,193 @@ describe.sequential("Jobs API routes", () => {
     expect(defaultRes.status).toBe(200);
     expect(defaultBody.ok).toBe(true);
     expect(defaultBody.data.jobs[0]).not.toHaveProperty("jobDescription");
+    expect(defaultBody.data.jobs[0]).not.toHaveProperty(
+      "appliedDuplicateMatch",
+    );
     expect(typeof defaultBody.data.revision).toBe("string");
+  });
+
+  it("keeps the jobs list response contract unchanged in benchmark mode", async () => {
+    await stopServer({ server, closeDb, tempDir });
+    ({ server, baseUrl, closeDb, tempDir } = await startServer({
+      env: { BENCHMARK_JOBS_TIMING: "1" },
+    }));
+
+    const { createJob } = await import("@server/repositories/jobs");
+    await createJob({
+      source: "manual",
+      title: "Bench Mode Role",
+      employer: "Acme",
+      jobUrl: "https://example.com/job/bench-mode",
+      jobDescription: "Bench mode description",
+    });
+
+    const res = await fetch(`${baseUrl}/api/jobs?view=list`);
+    const body = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(body.ok).toBe(true);
+    expect(body.data).toHaveProperty("jobs");
+    expect(body.data).toHaveProperty("total");
+    expect(body.data).toHaveProperty("byStatus");
+    expect(body.data).toHaveProperty("revision");
+    expect(body.data).not.toHaveProperty("totalMs");
+    expect(body.data).not.toHaveProperty("internalRouteMs");
+    expect(typeof body.meta.requestId).toBe("string");
+  });
+
+  it("emits the benchmark log only when benchmark mode is enabled", async () => {
+    const { logger } = await import("@infra/logger");
+    const infoSpy = vi.spyOn(logger, "info");
+    const { createJob } = await import("@server/repositories/jobs");
+
+    await createJob({
+      source: "manual",
+      title: "No Benchmark Role",
+      employer: "Acme",
+      jobUrl: "https://example.com/job/no-benchmark-log",
+      jobDescription: "No benchmark log description",
+    });
+
+    await fetch(`${baseUrl}/api/jobs?view=list`);
+
+    expect(
+      infoSpy.mock.calls.filter(
+        ([message]) => message === "Jobs list benchmark",
+      ),
+    ).toHaveLength(0);
+
+    infoSpy.mockClear();
+    infoSpy.mockRestore();
+
+    await stopServer({ server, closeDb, tempDir });
+    ({ server, baseUrl, closeDb, tempDir } = await startServer({
+      env: { BENCHMARK_JOBS_TIMING: "1" },
+    }));
+
+    const { logger: enabledLogger } = await import("@infra/logger");
+    const enabledInfoSpy = vi.spyOn(enabledLogger, "info");
+    const enabledRepo = await import("@server/repositories/jobs");
+    await enabledRepo.createJob({
+      source: "manual",
+      title: "Benchmark Role",
+      employer: "Acme",
+      jobUrl: "https://example.com/job/benchmark-log",
+      jobDescription: "Benchmark log description",
+    });
+
+    await fetch(`${baseUrl}/api/jobs?view=list`);
+
+    const benchmarkCalls = enabledInfoSpy.mock.calls.filter(
+      ([message]) => message === "Jobs list benchmark",
+    );
+
+    expect(benchmarkCalls).toHaveLength(1);
+    expect(benchmarkCalls[0]?.[1]).toMatchObject({
+      route: "GET /api/jobs",
+      view: "list",
+      duplicateMatchingEnabled: false,
+      returnedCount: 1,
+      candidateCount: 0,
+    });
+
+    enabledInfoSpy.mockRestore();
+  });
+
+  it("omits applied duplicate match metadata from list responses and keeps it in detail responses", async () => {
+    const { createJob, updateJob } = await import("@server/repositories/jobs");
+    const appliedJob = await createJob({
+      source: "manual",
+      title: "Backend Engineer",
+      employer: "Acme Ltd",
+      jobUrl: "https://example.com/job/applied-original",
+      jobDescription: "Original description",
+    });
+    const repostedJob = await createJob({
+      source: "manual",
+      title: "Backend Engineer",
+      employer: "Acme Limited",
+      jobUrl: "https://example.com/job/reposted",
+      jobDescription: "Reposted description",
+    });
+
+    await updateJob(appliedJob.id, {
+      status: "applied",
+      appliedAt: "2026-04-01T10:00:00.000Z",
+    });
+    await updateJob(repostedJob.id, { status: "ready" });
+
+    const listRes = await fetch(`${baseUrl}/api/jobs?view=list`);
+    const listBody = await listRes.json();
+    const repostedListItem = listBody.data.jobs.find(
+      (job: { id: string }) => job.id === repostedJob.id,
+    );
+    const appliedListItem = listBody.data.jobs.find(
+      (job: { id: string }) => job.id === appliedJob.id,
+    );
+
+    expect(listRes.status).toBe(200);
+    expect(repostedListItem).not.toHaveProperty("appliedDuplicateMatch");
+    expect(appliedListItem).not.toHaveProperty("appliedDuplicateMatch");
+
+    const detailRes = await fetch(`${baseUrl}/api/jobs/${repostedJob.id}`);
+    const detailBody = await detailRes.json();
+
+    expect(detailRes.status).toBe(200);
+    expect(detailBody.ok).toBe(true);
+    expect(detailBody.data).toHaveProperty("appliedDuplicateMatch");
+    expect(detailBody.data.appliedDuplicateMatch?.jobId).toBe(appliedJob.id);
+    expect(detailBody.data.appliedDuplicateMatch?.score).toBe(100);
+  });
+
+  it("skips applied duplicate candidate fetching when the list only contains historical jobs", async () => {
+    const jobsRepo = await import("@server/repositories/jobs");
+    const candidateSpy = vi.spyOn(
+      jobsRepo,
+      "getAppliedDuplicateMatchCandidates",
+    );
+    const { createJob, updateJob } = jobsRepo;
+    const appliedJob = await createJob({
+      source: "manual",
+      title: "Applied Role",
+      employer: "Acme",
+      jobUrl: "https://example.com/job/applied-only",
+      jobDescription: "Applied description",
+    });
+    const inProgressJob = await createJob({
+      source: "manual",
+      title: "In Progress Role",
+      employer: "Acme",
+      jobUrl: "https://example.com/job/in-progress-only",
+      jobDescription: "In progress description",
+    });
+
+    await updateJob(appliedJob.id, {
+      status: "applied",
+      appliedAt: "2026-04-01T10:00:00.000Z",
+    });
+    await updateJob(inProgressJob.id, {
+      status: "in_progress",
+      appliedAt: "2026-04-02T10:00:00.000Z",
+    });
+
+    const listRes = await fetch(
+      `${baseUrl}/api/jobs?view=list&status=applied,in_progress`,
+    );
+    const listBody = await listRes.json();
+
+    expect(listRes.status).toBe(200);
+    expect(listBody.ok).toBe(true);
+    expect(candidateSpy).not.toHaveBeenCalled();
+    expect(listBody.data.jobs).toHaveLength(2);
+    expect(
+      listBody.data.jobs.every(
+        (job: { appliedDuplicateMatch?: unknown }) =>
+          !Object.hasOwn(job, "appliedDuplicateMatch"),
+      ),
+    ).toBe(true);
+
+    candidateSpy.mockRestore();
   });
 
   it("returns jobs revision and supports status filtering", async () => {
@@ -130,6 +320,346 @@ describe.sequential("Jobs API routes", () => {
   it("returns 404 for missing jobs", async () => {
     const res = await fetch(`${baseUrl}/api/jobs/missing-id`);
     expect(res.status).toBe(404);
+  });
+
+  describe("job notes", () => {
+    it("creates, lists, updates, and deletes notes for a job", async () => {
+      const { createJob } = await import("@server/repositories/jobs");
+      const job = await createJob({
+        source: "manual",
+        title: "Notes Role",
+        employer: "Acme",
+        jobUrl: "https://example.com/job/notes-flow",
+        jobDescription: "Test description",
+      });
+
+      const createRes = await fetch(`${baseUrl}/api/jobs/${job.id}/notes`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: "Why this company",
+          content: "Strong mission, team, and growth opportunities.",
+        }),
+      });
+      const createBody = await createRes.json();
+
+      expect(createRes.status).toBe(201);
+      expect(createBody.ok).toBe(true);
+      expect(createBody.data.title).toBe("Why this company");
+      expect(createBody.data.content).toBe(
+        "Strong mission, team, and growth opportunities.",
+      );
+      expect(createBody.data.jobId).toBe(job.id);
+      expect(createBody.data.createdAt).toBeTruthy();
+      expect(createBody.data.updatedAt).toBeTruthy();
+      expect(typeof createBody.meta.requestId).toBe("string");
+      expect(createRes.headers.get("x-request-id")).toBe(
+        createBody.meta.requestId,
+      );
+
+      const listRes = await fetch(`${baseUrl}/api/jobs/${job.id}/notes`);
+      const listBody = await listRes.json();
+
+      expect(listRes.status).toBe(200);
+      expect(listBody.ok).toBe(true);
+      expect(Array.isArray(listBody.data)).toBe(true);
+      expect(listBody.data).toHaveLength(1);
+      expect(listBody.data[0].id).toBe(createBody.data.id);
+      expect(listBody.data[0].title).toBe("Why this company");
+      expect(typeof listBody.meta.requestId).toBe("string");
+
+      const updateRes = await fetch(
+        `${baseUrl}/api/jobs/${job.id}/notes/${createBody.data.id}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            title: "Recruiter contact",
+            content: "Jamie Lee at Acme. Follow up next week.",
+          }),
+        },
+      );
+      const updateBody = await updateRes.json();
+
+      expect(updateRes.status).toBe(200);
+      expect(updateBody.ok).toBe(true);
+      expect(updateBody.data.title).toBe("Recruiter contact");
+      expect(updateBody.data.content).toBe(
+        "Jamie Lee at Acme. Follow up next week.",
+      );
+      expect(updateBody.data.updatedAt).toBeTruthy();
+      expect(typeof updateBody.meta.requestId).toBe("string");
+
+      const deleteRes = await fetch(
+        `${baseUrl}/api/jobs/${job.id}/notes/${createBody.data.id}`,
+        {
+          method: "DELETE",
+        },
+      );
+      const deleteBody = await deleteRes.json();
+
+      expect(deleteRes.status).toBe(200);
+      expect(deleteBody.ok).toBe(true);
+      expect(deleteBody.data).toBeNull();
+      expect(typeof deleteBody.meta.requestId).toBe("string");
+
+      const emptyRes = await fetch(`${baseUrl}/api/jobs/${job.id}/notes`);
+      const emptyBody = await emptyRes.json();
+      expect(emptyRes.status).toBe(200);
+      expect(emptyBody.ok).toBe(true);
+      expect(emptyBody.data).toHaveLength(0);
+    });
+
+    it("validates note payloads", async () => {
+      const { createJob } = await import("@server/repositories/jobs");
+      const job = await createJob({
+        source: "manual",
+        title: "Validation Role",
+        employer: "Acme",
+        jobUrl: "https://example.com/job/notes-validation",
+        jobDescription: "Test description",
+      });
+
+      const invalidCreateRes = await fetch(
+        `${baseUrl}/api/jobs/${job.id}/notes`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            title: "   ",
+            content: "x".repeat(20001),
+          }),
+        },
+      );
+      const invalidCreateBody = await invalidCreateRes.json();
+
+      expect(invalidCreateRes.status).toBe(400);
+      expect(invalidCreateBody.ok).toBe(false);
+      expect(invalidCreateBody.error.code).toBe("INVALID_REQUEST");
+      expect(typeof invalidCreateBody.meta.requestId).toBe("string");
+
+      const createRes = await fetch(`${baseUrl}/api/jobs/${job.id}/notes`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: "Interview prep",
+          content: "Focus on systems design and behavioral stories.",
+        }),
+      });
+      const createBody = await createRes.json();
+
+      expect(createRes.status).toBe(201);
+      expect(createBody.ok).toBe(true);
+
+      const invalidUpdateRes = await fetch(
+        `${baseUrl}/api/jobs/${job.id}/notes/${createBody.data.id}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            title: " ".repeat(2),
+            content: " ",
+          }),
+        },
+      );
+      const invalidUpdateBody = await invalidUpdateRes.json();
+
+      expect(invalidUpdateRes.status).toBe(400);
+      expect(invalidUpdateBody.ok).toBe(false);
+      expect(invalidUpdateBody.error.code).toBe("INVALID_REQUEST");
+      expect(typeof invalidUpdateBody.meta.requestId).toBe("string");
+    });
+
+    it("returns 404s for missing jobs and notes", async () => {
+      const { createJob } = await import("@server/repositories/jobs");
+      const job = await createJob({
+        source: "manual",
+        title: "Missing Note Role",
+        employer: "Acme",
+        jobUrl: "https://example.com/job/notes-missing",
+        jobDescription: "Test description",
+      });
+
+      const missingJobListRes = await fetch(
+        `${baseUrl}/api/jobs/missing-id/notes`,
+      );
+      const missingJobListBody = await missingJobListRes.json();
+
+      expect(missingJobListRes.status).toBe(404);
+      expect(missingJobListBody.ok).toBe(false);
+      expect(missingJobListBody.error.code).toBe("NOT_FOUND");
+      expect(typeof missingJobListBody.meta.requestId).toBe("string");
+
+      const missingJobCreateRes = await fetch(
+        `${baseUrl}/api/jobs/missing-id/notes`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            title: "Question",
+            content: "Answer",
+          }),
+        },
+      );
+      const missingJobCreateBody = await missingJobCreateRes.json();
+
+      expect(missingJobCreateRes.status).toBe(404);
+      expect(missingJobCreateBody.ok).toBe(false);
+      expect(missingJobCreateBody.error.code).toBe("NOT_FOUND");
+
+      const missingNotePatchRes = await fetch(
+        `${baseUrl}/api/jobs/${job.id}/notes/missing-note-id`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            title: "Updated",
+            content: "Updated answer",
+          }),
+        },
+      );
+      const missingNotePatchBody = await missingNotePatchRes.json();
+
+      expect(missingNotePatchRes.status).toBe(404);
+      expect(missingNotePatchBody.ok).toBe(false);
+      expect(missingNotePatchBody.error.code).toBe("NOT_FOUND");
+
+      const missingNoteDeleteRes = await fetch(
+        `${baseUrl}/api/jobs/${job.id}/notes/missing-note-id`,
+        {
+          method: "DELETE",
+        },
+      );
+      const missingNoteDeleteBody = await missingNoteDeleteRes.json();
+
+      expect(missingNoteDeleteRes.status).toBe(404);
+      expect(missingNoteDeleteBody.ok).toBe(false);
+      expect(missingNoteDeleteBody.error.code).toBe("NOT_FOUND");
+      expect(typeof missingNoteDeleteBody.meta.requestId).toBe("string");
+    });
+
+    it("orders notes by most recently updated first", async () => {
+      const { createJob } = await import("@server/repositories/jobs");
+      const job = await createJob({
+        source: "manual",
+        title: "Ordering Role",
+        employer: "Acme",
+        jobUrl: "https://example.com/job/notes-ordering",
+        jobDescription: "Test description",
+      });
+
+      const firstRes = await fetch(`${baseUrl}/api/jobs/${job.id}/notes`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: "Company research",
+          content: "Read the latest product launch post.",
+        }),
+      });
+      const firstBody = await firstRes.json();
+
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      const secondRes = await fetch(`${baseUrl}/api/jobs/${job.id}/notes`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: "Interview contacts",
+          content: "Met with Sara from recruiting.",
+        }),
+      });
+      const secondBody = await secondRes.json();
+
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      const updateRes = await fetch(
+        `${baseUrl}/api/jobs/${job.id}/notes/${firstBody.data.id}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            title: "Company research",
+            content: "Read the latest product launch post and team blog.",
+          }),
+        },
+      );
+      const updateBody = await updateRes.json();
+
+      expect(updateRes.status).toBe(200);
+      expect(updateBody.ok).toBe(true);
+
+      const listRes = await fetch(`${baseUrl}/api/jobs/${job.id}/notes`);
+      const listBody = await listRes.json();
+
+      expect(listRes.status).toBe(200);
+      expect(listBody.ok).toBe(true);
+      expect(listBody.data).toHaveLength(2);
+      expect(listBody.data[0].id).toBe(firstBody.data.id);
+      expect(listBody.data[1].id).toBe(secondBody.data.id);
+      expect(listBody.data[0].updatedAt >= listBody.data[1].updatedAt).toBe(
+        true,
+      );
+    });
+  });
+
+  it("uploads a PDF resume for a job and stores it in data/pdfs", async () => {
+    const { createJob } = await import("@server/repositories/jobs");
+    const job = await createJob({
+      source: "manual",
+      title: "Upload PDF Role",
+      employer: "Acme",
+      jobUrl: "https://example.com/job/upload-pdf",
+      jobDescription: "Test description",
+    });
+    const pdfContent = Buffer.from("%PDF-1.7\nUploaded resume\n");
+
+    const res = await fetch(`${baseUrl}/api/jobs/${job.id}/pdf`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        fileName: "external-resume.pdf",
+        mediaType: "application/pdf",
+        dataBase64: pdfContent.toString("base64"),
+      }),
+    });
+    const body = await res.json();
+    const storedPath = join(tempDir, "pdfs", `resume_${job.id}.pdf`);
+
+    expect(res.status).toBe(201);
+    expect(body.ok).toBe(true);
+    expect(body.data.pdfPath).toBe(storedPath);
+    expect(typeof body.meta.requestId).toBe("string");
+    await expect(readFile(storedPath, "utf8")).resolves.toContain(
+      "Uploaded resume",
+    );
+  });
+
+  it("rejects uploaded files that are not valid PDFs", async () => {
+    const { createJob } = await import("@server/repositories/jobs");
+    const job = await createJob({
+      source: "manual",
+      title: "Upload Bad PDF Role",
+      employer: "Acme",
+      jobUrl: "https://example.com/job/upload-bad-pdf",
+      jobDescription: "Test description",
+    });
+
+    const res = await fetch(`${baseUrl}/api/jobs/${job.id}/pdf`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        fileName: "external-resume.pdf",
+        mediaType: "application/pdf",
+        dataBase64: Buffer.from("not-a-pdf").toString("base64"),
+      }),
+    });
+    const body = await res.json();
+
+    expect(res.status).toBe(400);
+    expect(body.ok).toBe(false);
+    expect(body.error.code).toBe("INVALID_REQUEST");
+    expect(body.error.message).toMatch(/valid pdf/i);
+    expect(typeof body.meta.requestId).toBe("string");
   });
 
   it("updates core job detail fields", async () => {
@@ -312,6 +842,7 @@ describe.sequential("Jobs API routes", () => {
 
       expect(res.status).toBe(200);
       expect(vi.mocked(generateFinalPdf)).toHaveBeenCalledWith(job.id, {
+        analyticsOrigin: "generate_pdf",
         requestOrigin: "https://canonical.jobops.example",
       });
     } finally {
@@ -500,6 +1031,7 @@ describe.sequential("Jobs API routes", () => {
       expect(body.data.succeeded).toBe(1);
       expect(body.data.failed).toBe(1);
       expect(vi.mocked(processJob)).toHaveBeenCalledWith(discovered.id, {
+        analyticsOrigin: "move_to_ready",
         force: false,
         requestOrigin: "https://canonical.jobops.example",
       });
@@ -537,6 +1069,7 @@ describe.sequential("Jobs API routes", () => {
       expect(res.status).toBe(200);
       expect(body.ok).toBe(true);
       expect(vi.mocked(processJob)).toHaveBeenCalledWith(job.id, {
+        analyticsOrigin: "move_to_ready",
         force: false,
         requestOrigin: "https://canonical.jobops.example",
       });

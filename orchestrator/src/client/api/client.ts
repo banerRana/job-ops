@@ -2,6 +2,7 @@
  * API client for the orchestrator backend.
  */
 
+import { redirectToSignIn } from "@client/lib/auth-navigation";
 import type { UpdateSettingsInput } from "@shared/settings-schema";
 import type {
   ApiResponse,
@@ -10,7 +11,14 @@ import type {
   AppSettings,
   BackupInfo,
   BranchInfo,
+  CreateJobNoteInput,
   DemoInfoResponse,
+  DesignResumeDocument,
+  DesignResumeExportResponse,
+  DesignResumeJson,
+  DesignResumePatchRequest,
+  DesignResumePdfResponse,
+  DesignResumeStatusResponse,
   Job,
   JobActionRequest,
   JobActionResponse,
@@ -19,6 +27,7 @@ import type {
   JobChatStreamEvent,
   JobChatThread,
   JobListItem,
+  JobNote,
   JobOutcome,
   JobSource,
   JobsListResponse,
@@ -38,12 +47,13 @@ import type {
   ProfileStatusResponse,
   ResumeProfile,
   ResumeProjectCatalogItem,
-  RxResumeMode,
+  SearchTermsSuggestionResponse,
   StageEvent,
   StageEventMetadata,
   StageTransitionTarget,
   TracerAnalyticsResponse,
   TracerReadinessResponse,
+  UpdateJobNoteInput,
   ValidationResult,
   VisaSponsor,
   VisaSponsorSearchResponse,
@@ -90,41 +100,244 @@ type StreamSseInput =
   | { content: string; stream: true }
   | { stream: true };
 
-export type BasicAuthCredentials = {
+export type AuthCredentials = {
   username: string;
   password: string;
 };
 
-export type BasicAuthPromptRequest = {
-  endpoint: string;
-  method: string;
-  attempt: number;
-  usernameHint?: string;
-  errorMessage?: string;
+type StoredLegacyAuthCredentials = AuthCredentials & {
+  storedAt?: number;
 };
 
-type BasicAuthPromptHandler = (
-  request: BasicAuthPromptRequest,
-) => Promise<BasicAuthCredentials | null>;
+const LEGACY_SESSION_AUTH_KEY = "jobops.basicAuthCredentials";
+const LEGACY_SESSION_JWT_KEY = "jobops.jwtToken";
+const SESSION_AUTH_TOKEN_KEY = "jobops.authToken";
+const LEGACY_SESSION_AUTH_TTL_MS = 5 * 60 * 1000;
 
-let basicAuthPromptHandler: BasicAuthPromptHandler | null = null;
-let basicAuthPromptInFlight: Promise<BasicAuthCredentials | null> | null = null;
-let cachedBasicAuthCredentials: BasicAuthCredentials | null = null;
+function loadStoredLegacyCredentials(): AuthCredentials | null {
+  try {
+    const stored = sessionStorage.getItem(LEGACY_SESSION_AUTH_KEY);
+    if (!stored) return null;
+    // Migration credentials are one-shot: remove them from storage as soon as
+    // we read them, then keep them only in memory for the upgrade attempt.
+    sessionStorage.removeItem(LEGACY_SESSION_AUTH_KEY);
 
-export function setBasicAuthPromptHandler(
-  handler: BasicAuthPromptHandler | null,
-): void {
-  basicAuthPromptHandler = handler;
+    const parsed = JSON.parse(stored) as StoredLegacyAuthCredentials;
+    if (
+      !parsed ||
+      typeof parsed !== "object" ||
+      typeof parsed.username !== "string" ||
+      typeof parsed.password !== "string"
+    ) {
+      return null;
+    }
+
+    if (
+      typeof parsed.storedAt === "number" &&
+      Date.now() - parsed.storedAt > LEGACY_SESSION_AUTH_TTL_MS
+    ) {
+      return null;
+    }
+
+    return {
+      username: parsed.username,
+      password: parsed.password,
+    };
+  } catch {
+    return null;
+  }
 }
 
-export function clearBasicAuthCredentials(): void {
-  cachedBasicAuthCredentials = null;
+function storeLegacyCredentials(credentials: AuthCredentials | null): void {
+  try {
+    if (credentials) {
+      sessionStorage.setItem(
+        LEGACY_SESSION_AUTH_KEY,
+        JSON.stringify({
+          ...credentials,
+          storedAt: Date.now(),
+        } satisfies StoredLegacyAuthCredentials),
+      );
+    } else {
+      sessionStorage.removeItem(LEGACY_SESSION_AUTH_KEY);
+    }
+  } catch {
+    // Ignore storage errors in restricted browser contexts.
+  }
+}
+
+function loadStoredAuthToken(): string | null {
+  try {
+    return (
+      sessionStorage.getItem(SESSION_AUTH_TOKEN_KEY) ??
+      sessionStorage.getItem(LEGACY_SESSION_JWT_KEY)
+    );
+  } catch {
+    return null;
+  }
+}
+
+function storeAuthToken(token: string | null): void {
+  try {
+    if (token) {
+      sessionStorage.setItem(SESSION_AUTH_TOKEN_KEY, token);
+      sessionStorage.removeItem(LEGACY_SESSION_JWT_KEY);
+    } else {
+      sessionStorage.removeItem(SESSION_AUTH_TOKEN_KEY);
+      sessionStorage.removeItem(LEGACY_SESSION_JWT_KEY);
+    }
+  } catch {
+    // Ignore storage errors in restricted browser contexts.
+  }
+}
+
+let cachedLegacyCredentials: AuthCredentials | null =
+  loadStoredLegacyCredentials();
+let cachedAuthToken: string | null = loadStoredAuthToken();
+let authMigrationInFlight: Promise<boolean> | null = null;
+
+export function clearAuthSession(): void {
+  cachedLegacyCredentials = null;
+  cachedAuthToken = null;
+  storeLegacyCredentials(null);
+  storeAuthToken(null);
+}
+
+function setAuthenticatedSession(token: string): void {
+  cachedAuthToken = token;
+  storeAuthToken(token);
+  cachedLegacyCredentials = null;
+  storeLegacyCredentials(null);
+}
+
+async function readAuthResponse<T>(
+  response: Response,
+): Promise<ApiResponse<T> | LegacyApiResponse<T>> {
+  const text = await response.text();
+  let payload: unknown;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    throw new ApiClientError(
+      `Server error (${response.status}): Expected JSON but received HTML. Is the backend server running?`,
+      { status: response.status },
+    );
+  }
+
+  return normalizeApiResponse<T>(payload);
+}
+
+export async function signInWithCredentials(
+  username: string,
+  password: string,
+): Promise<void> {
+  const res = await fetch("/api/auth/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password }),
+  });
+
+  const parsed = await readAuthResponse<{ token: string }>(res);
+  if ("ok" in parsed) {
+    if (!parsed.ok) {
+      throw toApiError(res, parsed);
+    }
+  } else if (!parsed.success) {
+    throw toApiError(res, parsed);
+  }
+
+  const token =
+    "ok" in parsed
+      ? parsed.data?.token
+      : (parsed.data as { token?: string } | undefined)?.token;
+  if (!token) {
+    throw new Error("No token returned");
+  }
+  setAuthenticatedSession(token);
+}
+
+export async function restoreAuthSessionFromLegacyCredentials(): Promise<boolean> {
+  if (cachedAuthToken) return true;
+  if (!cachedLegacyCredentials) return false;
+  if (!authMigrationInFlight) {
+    const credentials = cachedLegacyCredentials;
+    cachedLegacyCredentials = null;
+    storeLegacyCredentials(null);
+    authMigrationInFlight = (async () => {
+      try {
+        await signInWithCredentials(credentials.username, credentials.password);
+        return true;
+      } catch {
+        return false;
+      } finally {
+        authMigrationInFlight = null;
+      }
+    })();
+  }
+  return authMigrationInFlight;
+}
+
+async function recoverAuthSessionFromUnauthorized(): Promise<string | null> {
+  cachedAuthToken = null;
+  storeAuthToken(null);
+
+  const restored = await restoreAuthSessionFromLegacyCredentials();
+  if (restored && cachedAuthToken) {
+    return `Bearer ${cachedAuthToken}`;
+  }
+
+  clearAuthSession();
+  redirectToSignIn();
+  return null;
+}
+
+export async function recoverAuthHeaderAfterUnauthorized(): Promise<
+  string | null
+> {
+  return recoverAuthSessionFromUnauthorized();
+}
+
+export async function logout(): Promise<void> {
+  if (cachedAuthToken) {
+    try {
+      await fetch("/api/auth/logout", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${cachedAuthToken}` },
+      });
+    } catch {
+      // Best-effort server-side invalidation.
+    }
+  }
+  clearAuthSession();
+  redirectToSignIn();
+}
+
+export function getCachedAuthHeader(): string | undefined {
+  return cachedAuthToken ? `Bearer ${cachedAuthToken}` : undefined;
+}
+
+export function hasAuthenticatedSession(): boolean {
+  return Boolean(cachedAuthToken);
 }
 
 export function __resetApiClientAuthForTests(): void {
-  basicAuthPromptHandler = null;
-  basicAuthPromptInFlight = null;
-  cachedBasicAuthCredentials = null;
+  cachedLegacyCredentials = null;
+  cachedAuthToken = null;
+  authMigrationInFlight = null;
+  storeLegacyCredentials(null);
+  storeAuthToken(null);
+}
+
+export function __setLegacyAuthCredentialsForTests(
+  credentials: AuthCredentials | null,
+): void {
+  cachedLegacyCredentials = credentials;
+  storeLegacyCredentials(credentials);
+}
+
+export function __setAuthTokenForTests(token: string | null): void {
+  cachedAuthToken = token;
+  storeAuthToken(token);
 }
 
 function normalizeApiResponse<T>(
@@ -170,10 +383,6 @@ function describeAction(endpoint: string, method?: string): string {
   return "This action ran in demo simulation mode.";
 }
 
-function encodeBasicAuth(credentials: BasicAuthCredentials): string {
-  return `Basic ${btoa(`${credentials.username}:${credentials.password}`)}`;
-}
-
 function normalizeHeaders(headers?: HeadersInit): Record<string, string> {
   if (!headers) return {};
   if (headers instanceof Headers) {
@@ -187,10 +396,6 @@ function normalizeHeaders(headers?: HeadersInit): Record<string, string> {
     return Object.fromEntries(headers);
   }
   return { ...headers };
-}
-
-function isWriteMethod(method: string): boolean {
-  return !["GET", "HEAD", "OPTIONS"].includes(method.toUpperCase());
 }
 
 function isUnauthorizedResponse<T>(
@@ -234,18 +439,6 @@ function toApiError<T>(
   );
 }
 
-async function requestBasicAuthCredentials(
-  request: BasicAuthPromptRequest,
-): Promise<BasicAuthCredentials | null> {
-  if (!basicAuthPromptHandler) return null;
-  if (!basicAuthPromptInFlight) {
-    basicAuthPromptInFlight = basicAuthPromptHandler(request).finally(() => {
-      basicAuthPromptInFlight = null;
-    });
-  }
-  return basicAuthPromptInFlight;
-}
-
 async function fetchAndParse<T>(
   endpoint: string,
   options: RequestInit | undefined,
@@ -280,16 +473,16 @@ async function fetchAndParse<T>(
   return { response, parsed };
 }
 
+function getAuthHeader(): string | undefined {
+  return getCachedAuthHeader();
+}
+
 async function fetchApi<T>(
   endpoint: string,
   options?: RequestInit,
 ): Promise<T> {
-  const method = (options?.method || "GET").toUpperCase();
-  let authHeader = cachedBasicAuthCredentials
-    ? encodeBasicAuth(cachedBasicAuthCredentials)
-    : undefined;
+  let authHeader = getAuthHeader();
   let authAttempt = 0;
-  let usernameHint = cachedBasicAuthCredentials?.username;
 
   while (true) {
     const { response, parsed } = await fetchAndParse(
@@ -298,28 +491,12 @@ async function fetchApi<T>(
       authHeader,
     );
 
-    if (
-      isWriteMethod(method) &&
-      isUnauthorizedResponse(response, parsed) &&
-      basicAuthPromptHandler &&
-      authAttempt < 2
-    ) {
-      const credentials = await requestBasicAuthCredentials({
-        endpoint,
-        method,
-        attempt: authAttempt + 1,
-        usernameHint,
-        errorMessage:
-          authAttempt > 0
-            ? "Invalid credentials. Please try again."
-            : undefined,
-      });
-      if (!credentials) {
+    if (isUnauthorizedResponse(response, parsed) && authAttempt < 1) {
+      const recoveredAuthHeader = await recoverAuthSessionFromUnauthorized();
+      if (!recoveredAuthHeader) {
         throw toApiError(response, parsed);
       }
-      cachedBasicAuthCredentials = credentials;
-      usernameHint = credentials.username;
-      authHeader = encodeBasicAuth(credentials);
+      authHeader = recoveredAuthHeader;
       authAttempt += 1;
       continue;
     }
@@ -327,7 +504,8 @@ async function fetchApi<T>(
     if ("ok" in parsed) {
       if (!parsed.ok) {
         if (parsed.error.code === "UNAUTHORIZED") {
-          clearBasicAuthCredentials();
+          clearAuthSession();
+          redirectToSignIn();
         }
         if (parsed.meta?.blockedReason) {
           showDemoBlockedToast(parsed.meta.blockedReason);
@@ -342,7 +520,8 @@ async function fetchApi<T>(
 
     if (!parsed.success) {
       if (response.status === 401) {
-        clearBasicAuthCredentials();
+        clearAuthSession();
+        redirectToSignIn();
       }
       throw toApiError(response, parsed);
     }
@@ -401,6 +580,54 @@ export async function updateJob(
   return fetchApi<Job>(`/jobs/${id}`, {
     method: "PATCH",
     body: JSON.stringify(update),
+  });
+}
+
+export async function getJobNotes(id: string): Promise<JobNote[]> {
+  return fetchApi<JobNote[]>(`/jobs/${id}/notes?t=${Date.now()}`);
+}
+
+export async function createJobNote(
+  jobId: string,
+  input: CreateJobNoteInput,
+): Promise<JobNote> {
+  return fetchApi<JobNote>(`/jobs/${jobId}/notes`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export async function updateJobNote(
+  jobId: string,
+  noteId: string,
+  input: UpdateJobNoteInput,
+): Promise<JobNote> {
+  return fetchApi<JobNote>(`/jobs/${jobId}/notes/${noteId}`, {
+    method: "PATCH",
+    body: JSON.stringify(input),
+  });
+}
+
+export async function deleteJobNote(
+  jobId: string,
+  noteId: string,
+): Promise<void> {
+  await fetchApi<void>(`/jobs/${jobId}/notes/${noteId}`, {
+    method: "DELETE",
+  });
+}
+
+export async function uploadJobPdf(
+  id: string,
+  input: {
+    fileName: string;
+    mediaType?: string;
+    dataBase64: string;
+  },
+): Promise<Job> {
+  return fetchApi<Job>(`/jobs/${id}/pdf`, {
+    method: "POST",
+    body: JSON.stringify(input),
   });
 }
 
@@ -478,16 +705,32 @@ async function streamSseEvents<TEvent>(
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
   };
-  if (cachedBasicAuthCredentials) {
-    headers.Authorization = encodeBasicAuth(cachedBasicAuthCredentials);
+  const streamAuth = getAuthHeader();
+  if (streamAuth) {
+    headers.Authorization = streamAuth;
   }
 
-  const response = await fetch(`${API_BASE}${endpoint}`, {
+  let response = await fetch(`${API_BASE}${endpoint}`, {
     method: "POST",
     headers,
     body: JSON.stringify(input),
     signal: handlers.signal,
   });
+
+  if (response.status === 401) {
+    const recoveredAuthHeader = await recoverAuthSessionFromUnauthorized();
+    if (recoveredAuthHeader) {
+      response = await fetch(`${API_BASE}${endpoint}`, {
+        method: "POST",
+        headers: {
+          ...headers,
+          Authorization: recoveredAuthHeader,
+        },
+        body: JSON.stringify(input),
+        signal: handlers.signal,
+      });
+    }
+  }
 
   if (!response.ok) {
     let errorMessage = `Stream request failed with status ${response.status}`;
@@ -1301,7 +1544,6 @@ export async function getResumeProjectsCatalog(): Promise<
       return await getRxResumeProjects(
         settings.rxresumeBaseResumeId,
         undefined,
-        settings.rxresumeMode?.value,
       );
     }
   } catch {
@@ -1313,6 +1555,72 @@ export async function getResumeProjectsCatalog(): Promise<
 
 export async function getProfile(): Promise<ResumeProfile> {
   return fetchApi<ResumeProfile>("/profile");
+}
+
+export async function getDesignResume(): Promise<DesignResumeDocument> {
+  return fetchApi<DesignResumeDocument>("/design-resume");
+}
+
+export async function getDesignResumeStatus(): Promise<DesignResumeStatusResponse> {
+  return fetchApi<DesignResumeStatusResponse>("/design-resume/status");
+}
+
+export async function importDesignResumeFromRxResume(): Promise<DesignResumeDocument> {
+  return fetchApi<DesignResumeDocument>("/design-resume/import/rxresume", {
+    method: "POST",
+  });
+}
+
+export async function importDesignResumeFromFile(input: {
+  fileName: string;
+  mediaType?: string;
+  dataBase64: string;
+}): Promise<DesignResumeDocument> {
+  return fetchApi<DesignResumeDocument>("/design-resume/import/file", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export async function updateDesignResume(
+  input: DesignResumePatchRequest,
+): Promise<DesignResumeDocument> {
+  return fetchApi<DesignResumeDocument>("/design-resume", {
+    method: "PATCH",
+    body: JSON.stringify(input),
+  });
+}
+
+export async function uploadDesignResumePicture(input: {
+  fileName: string;
+  dataUrl: string;
+  baseRevision?: number;
+  document?: DesignResumeJson;
+}): Promise<DesignResumeDocument> {
+  return fetchApi<DesignResumeDocument>("/design-resume/assets", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export async function deleteDesignResumePicture(input?: {
+  baseRevision?: number;
+  document?: DesignResumeJson;
+}): Promise<DesignResumeDocument> {
+  return fetchApi<DesignResumeDocument>("/design-resume/assets/picture", {
+    method: "DELETE",
+    body: JSON.stringify(input ?? {}),
+  });
+}
+
+export async function exportDesignResume(): Promise<DesignResumeExportResponse> {
+  return fetchApi<DesignResumeExportResponse>("/design-resume/export");
+}
+
+export async function generateDesignResumePdf(): Promise<DesignResumePdfResponse> {
+  return fetchApi<DesignResumePdfResponse>("/design-resume/generate-pdf", {
+    method: "POST",
+  });
 }
 
 export async function getProfileStatus(): Promise<ProfileStatusResponse> {
@@ -1349,9 +1657,6 @@ export async function getLlmModels(input?: {
 }
 
 export async function validateRxresume(input?: {
-  mode?: "v4" | "v5";
-  email?: string;
-  password?: string;
   apiKey?: string;
   baseUrl?: string;
 }): Promise<ValidationResult> {
@@ -1365,6 +1670,15 @@ export async function validateResumeConfig(): Promise<ValidationResult> {
   return fetchApi<ValidationResult>("/onboarding/validate/resume");
 }
 
+export async function suggestOnboardingSearchTerms(): Promise<SearchTermsSuggestionResponse> {
+  return fetchApi<SearchTermsSuggestionResponse>(
+    "/onboarding/search-terms/suggest",
+    {
+      method: "POST",
+    },
+  );
+}
+
 export async function updateSettings(
   update: Partial<UpdateSettingsInput>,
 ): Promise<AppSettings> {
@@ -1374,12 +1688,9 @@ export async function updateSettings(
   });
 }
 
-export async function getRxResumes(
-  mode?: RxResumeMode,
-): Promise<{ id: string; name: string }[]> {
-  const query = mode ? `?mode=${encodeURIComponent(mode)}` : "";
+export async function getRxResumes(): Promise<{ id: string; name: string }[]> {
   const data = await fetchApi<{ resumes: { id: string; name: string }[] }>(
-    `/settings/rx-resumes${query}`,
+    `/settings/rx-resumes`,
   );
   return data.resumes;
 }
@@ -1387,11 +1698,9 @@ export async function getRxResumes(
 export async function getRxResumeProjects(
   resumeId: string,
   signal?: AbortSignal,
-  mode?: RxResumeMode,
 ): Promise<ResumeProjectCatalogItem[]> {
-  const query = mode ? `?mode=${encodeURIComponent(mode)}` : "";
   const data = await fetchApi<{ projects: ResumeProjectCatalogItem[] }>(
-    `/settings/rx-resumes/${encodeURIComponent(resumeId)}/projects${query}`,
+    `/settings/rx-resumes/${encodeURIComponent(resumeId)}/projects`,
     { signal },
   );
   return data.projects;

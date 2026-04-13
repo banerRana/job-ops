@@ -74,6 +74,7 @@ const migrations = [
     tracer_links_enabled INTEGER NOT NULL DEFAULT 0,
     discovered_at TEXT NOT NULL DEFAULT (datetime('now')),
     processed_at TEXT,
+    ready_at TEXT,
     applied_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -95,6 +96,49 @@ const migrations = [
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
   )`,
+
+  `CREATE TABLE IF NOT EXISTS auth_sessions (
+    id TEXT PRIMARY KEY,
+    subject TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    revoked_at INTEGER,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+
+  `CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires_at
+    ON auth_sessions(expires_at)`,
+
+  `CREATE INDEX IF NOT EXISTS idx_auth_sessions_revoked_at
+    ON auth_sessions(revoked_at)`,
+
+  `CREATE TABLE IF NOT EXISTS design_resume_documents (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    resume_json TEXT NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 1,
+    source_resume_id TEXT,
+    source_mode TEXT CHECK(source_mode IN ('v4', 'v5')),
+    imported_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS design_resume_assets (
+    id TEXT PRIMARY KEY,
+    document_id TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'picture' CHECK(kind IN ('picture')),
+    original_name TEXT NOT NULL,
+    mime_type TEXT NOT NULL,
+    byte_size INTEGER NOT NULL,
+    storage_path TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (document_id) REFERENCES design_resume_documents(id) ON DELETE CASCADE
+  )`,
+
+  `CREATE INDEX IF NOT EXISTS idx_design_resume_assets_document_id
+    ON design_resume_assets(document_id)`,
 
   `CREATE TABLE IF NOT EXISTS job_chat_threads (
     id TEXT PRIMARY KEY,
@@ -167,6 +211,19 @@ const migrations = [
     notes TEXT,
     FOREIGN KEY (application_id) REFERENCES jobs(id) ON DELETE CASCADE
   )`,
+
+  `CREATE TABLE IF NOT EXISTS job_notes (
+    id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+  )`,
+
+  `CREATE INDEX IF NOT EXISTS idx_job_notes_job_updated
+    ON job_notes(job_id, updated_at)`,
 
   `CREATE TABLE IF NOT EXISTS interviews (
     id TEXT PRIMARY KEY,
@@ -339,9 +396,13 @@ const migrations = [
   // Add application tracking columns
   `ALTER TABLE jobs ADD COLUMN outcome TEXT`,
   `ALTER TABLE jobs ADD COLUMN closed_at INTEGER`,
+  `ALTER TABLE jobs ADD COLUMN ready_at TEXT`,
   `ALTER TABLE stage_events ADD COLUMN outcome TEXT`,
   `ALTER TABLE stage_events ADD COLUMN title TEXT NOT NULL DEFAULT ''`,
   `ALTER TABLE stage_events ADD COLUMN group_id TEXT`,
+  `UPDATE jobs
+   SET ready_at = COALESCE(ready_at, updated_at)
+   WHERE status = 'ready' AND ready_at IS NULL`,
 
   // Smart-router columns for existing databases.
   `ALTER TABLE post_application_messages ADD COLUMN match_confidence INTEGER`,
@@ -446,6 +507,7 @@ const migrations = [
     sponsor_match_names TEXT,
     discovered_at TEXT NOT NULL DEFAULT (datetime('now')),
     processed_at TEXT,
+    ready_at TEXT,
     applied_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -459,6 +521,7 @@ const migrations = [
     deadline, salary, location, degree_required, starting, job_description, status, outcome, closed_at,
     suitability_score, suitability_reason, tailored_summary, tailored_headline, tailored_skills,
     selected_project_ids, pdf_path, tracer_links_enabled, sponsor_match_score, sponsor_match_names, discovered_at, processed_at,
+    ready_at,
     applied_at, created_at, updated_at
   )
   SELECT
@@ -470,6 +533,7 @@ const migrations = [
     deadline, salary, location, degree_required, starting, job_description, status, outcome, closed_at,
     suitability_score, suitability_reason, tailored_summary, tailored_headline, tailored_skills,
     selected_project_ids, pdf_path, tracer_links_enabled, sponsor_match_score, sponsor_match_names, discovered_at, processed_at,
+    ready_at,
     applied_at, created_at, updated_at
   FROM jobs`,
   `DROP TABLE IF EXISTS jobs`,

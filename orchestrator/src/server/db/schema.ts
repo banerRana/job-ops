@@ -107,6 +107,7 @@ export const jobs = sqliteTable("jobs", {
   // Timestamps
   discoveredAt: text("discovered_at").notNull().default(sql`(datetime('now'))`),
   processedAt: text("processed_at"),
+  readyAt: text("ready_at"),
   appliedAt: text("applied_at"),
   createdAt: text("created_at").notNull().default(sql`(datetime('now'))`),
   updatedAt: text("updated_at").notNull().default(sql`(datetime('now'))`),
@@ -139,6 +140,26 @@ export const tasks = sqliteTable("tasks", {
     .default(false),
   notes: text("notes"),
 });
+
+export const jobNotes = sqliteTable(
+  "job_notes",
+  {
+    id: text("id").primaryKey(),
+    jobId: text("job_id")
+      .notNull()
+      .references(() => jobs.id, { onDelete: "cascade" }),
+    title: text("title").notNull(),
+    content: text("content").notNull(),
+    createdAt: text("created_at").notNull().default(sql`(datetime('now'))`),
+    updatedAt: text("updated_at").notNull().default(sql`(datetime('now'))`),
+  },
+  (table) => ({
+    jobUpdatedIndex: index("idx_job_notes_job_updated").on(
+      table.jobId,
+      table.updatedAt,
+    ),
+  }),
+);
 
 export const interviews = sqliteTable("interviews", {
   id: text("id").primaryKey(),
@@ -255,6 +276,58 @@ export const settings = sqliteTable("settings", {
   createdAt: text("created_at").notNull().default(sql`(datetime('now'))`),
   updatedAt: text("updated_at").notNull().default(sql`(datetime('now'))`),
 });
+
+export const authSessions = sqliteTable(
+  "auth_sessions",
+  {
+    id: text("id").primaryKey(),
+    subject: text("subject").notNull(),
+    expiresAt: integer("expires_at", { mode: "number" }).notNull(),
+    revokedAt: integer("revoked_at", { mode: "number" }),
+    createdAt: text("created_at").notNull().default(sql`(datetime('now'))`),
+    updatedAt: text("updated_at").notNull().default(sql`(datetime('now'))`),
+  },
+  (table) => ({
+    expiresAtIndex: index("idx_auth_sessions_expires_at").on(table.expiresAt),
+    revokedAtIndex: index("idx_auth_sessions_revoked_at").on(table.revokedAt),
+  }),
+);
+
+export const designResumeDocuments = sqliteTable("design_resume_documents", {
+  id: text("id").primaryKey(),
+  title: text("title").notNull(),
+  resumeJson: text("resume_json", { mode: "json" }).notNull(),
+  revision: integer("revision").notNull().default(1),
+  sourceResumeId: text("source_resume_id"),
+  sourceMode: text("source_mode"),
+  importedAt: text("imported_at"),
+  createdAt: text("created_at").notNull().default(sql`(datetime('now'))`),
+  updatedAt: text("updated_at").notNull().default(sql`(datetime('now'))`),
+});
+
+export const designResumeAssets = sqliteTable(
+  "design_resume_assets",
+  {
+    id: text("id").primaryKey(),
+    documentId: text("document_id")
+      .notNull()
+      .references(() => designResumeDocuments.id, { onDelete: "cascade" }),
+    kind: text("kind", { enum: ["picture"] })
+      .notNull()
+      .default("picture"),
+    originalName: text("original_name").notNull(),
+    mimeType: text("mime_type").notNull(),
+    byteSize: integer("byte_size").notNull(),
+    storagePath: text("storage_path").notNull(),
+    createdAt: text("created_at").notNull().default(sql`(datetime('now'))`),
+    updatedAt: text("updated_at").notNull().default(sql`(datetime('now'))`),
+  },
+  (table) => ({
+    documentIndex: index("idx_design_resume_assets_document_id").on(
+      table.documentId,
+    ),
+  }),
+);
 
 export const postApplicationIntegrations = sqliteTable(
   "post_application_integrations",
@@ -444,6 +517,8 @@ export type StageEventRow = typeof stageEvents.$inferSelect;
 export type NewStageEventRow = typeof stageEvents.$inferInsert;
 export type TaskRow = typeof tasks.$inferSelect;
 export type NewTaskRow = typeof tasks.$inferInsert;
+export type JobNoteRow = typeof jobNotes.$inferSelect;
+export type NewJobNoteRow = typeof jobNotes.$inferInsert;
 export type InterviewRow = typeof interviews.$inferSelect;
 export type NewInterviewRow = typeof interviews.$inferInsert;
 export type PipelineRunRow = typeof pipelineRuns.$inferSelect;
@@ -456,6 +531,11 @@ export type JobChatRunRow = typeof jobChatRuns.$inferSelect;
 export type NewJobChatRunRow = typeof jobChatRuns.$inferInsert;
 export type SettingsRow = typeof settings.$inferSelect;
 export type NewSettingsRow = typeof settings.$inferInsert;
+export type DesignResumeDocumentRow = typeof designResumeDocuments.$inferSelect;
+export type NewDesignResumeDocumentRow =
+  typeof designResumeDocuments.$inferInsert;
+export type DesignResumeAssetRow = typeof designResumeAssets.$inferSelect;
+export type NewDesignResumeAssetRow = typeof designResumeAssets.$inferInsert;
 export type PostApplicationIntegrationRow =
   typeof postApplicationIntegrations.$inferSelect;
 export type NewPostApplicationIntegrationRow =

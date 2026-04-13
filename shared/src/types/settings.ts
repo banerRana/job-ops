@@ -12,7 +12,12 @@ export interface ResumeProjectsSettings {
   aiSelectableProjectIds: string[];
 }
 
-export type RxResumeMode = "v4" | "v5";
+export const PDF_RENDERER_VALUES = ["rxresume", "latex"] as const;
+export type PdfRenderer = (typeof PDF_RENDERER_VALUES)[number];
+export const PDF_RENDERER_LABELS: Record<PdfRenderer, string> = {
+  rxresume: "RxResume export",
+  latex: "Local LaTeX (Jake template)",
+};
 
 export const CHAT_STYLE_LANGUAGE_MODE_VALUES = [
   "manual",
@@ -130,6 +135,11 @@ export interface ValidationResult {
   status?: number | null;
 }
 
+export interface SearchTermsSuggestionResponse {
+  terms: string[];
+  source: "ai" | "fallback";
+}
+
 export interface DemoInfoResponse {
   demoMode: boolean;
   resetCadenceHours: number;
@@ -150,6 +160,7 @@ export interface AppSettings {
   pipelineWebhookUrl: Resolved<string>;
   jobCompleteWebhookUrl: Resolved<string>;
   resumeProjects: Resolved<ResumeProjectsSettings>;
+  pdfRenderer: Resolved<PdfRenderer>;
   ukvisajobsMaxJobs: Resolved<number>;
   adzunaMaxJobsPerTerm: Resolved<number>;
   gradcrackerMaxJobsPerTerm: Resolved<number>;
@@ -158,6 +169,9 @@ export interface AppSettings {
   workplaceTypes: Resolved<Array<"remote" | "hybrid" | "onsite">>;
   blockedCompanyKeywords: Resolved<string[]>;
   scoringInstructions: Resolved<string>;
+  ghostwriterSystemPromptTemplate: Resolved<string>;
+  tailoringPromptTemplate: Resolved<string>;
+  scoringPromptTemplate: Resolved<string>;
   searchCities: Resolved<string>;
   jobspyResultsWanted: Resolved<number>;
   jobspyCountryIndeed: Resolved<string>;
@@ -169,13 +183,14 @@ export interface AppSettings {
   chatStyleDoNotUse: Resolved<string>;
   chatStyleLanguageMode: Resolved<ChatStyleLanguageMode>;
   chatStyleManualLanguage: Resolved<ChatStyleManualLanguage>;
+  chatStyleSummaryMaxWords: Resolved<number | null>;
+  chatStyleMaxKeywordsPerSkill: Resolved<number | null>;
   backupEnabled: Resolved<boolean>;
   backupHour: Resolved<number>;
   backupMaxCount: Resolved<number>;
   penalizeMissingSalary: Resolved<boolean>;
   missingSalaryPenalty: Resolved<number>;
   autoSkipScoreThreshold: Resolved<number | null>;
-  rxresumeMode: Resolved<RxResumeMode>;
 
   // Model variants (no own default, fallback to model.value):
   modelScorer: ModelResolved;
@@ -184,18 +199,16 @@ export interface AppSettings {
 
   // Simple strings:
   rxresumeBaseResumeId: string | null;
-  rxresumeBaseResumeIdV4: string | null;
-  rxresumeBaseResumeIdV5: string | null;
-  rxresumeEmail: string | null;
+  onboardingBasicAuthDecision: "enabled" | "skipped" | null;
   rxresumeUrl: string | null;
   ukvisajobsEmail: string | null;
   adzunaAppId: string | null;
   basicAuthUser: string | null;
+  basicAuthPassword: string | null;
 
   // Secret hints:
   llmApiKeyHint: string | null;
   rxresumeApiKeyHint: string | null;
-  rxresumePasswordHint: string | null;
   ukvisajobsPasswordHint: string | null;
   adzunaAppKeyHint: string | null;
   basicAuthPasswordHint: string | null;

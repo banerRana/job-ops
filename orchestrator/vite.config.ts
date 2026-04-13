@@ -37,7 +37,7 @@ export default defineConfig({
     globals: true,
     environment: "jsdom",
     setupFiles: "./src/setupTests.ts",
-    maxWorkers: 1,
+    pool: "forks",
     testTimeout: 30_000,
     hookTimeout: 30_000,
     include: [
@@ -57,6 +57,7 @@ export default defineConfig({
       "@server": path.resolve(__dirname, "./src/server"),
       "@infra": path.resolve(__dirname, "./src/server/infra"),
       "@shared": path.resolve(__dirname, "../shared/src"),
+      "job-ops-shared": path.resolve(__dirname, "../shared/src"),
     },
   },
   server: {

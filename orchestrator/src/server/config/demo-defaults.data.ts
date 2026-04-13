@@ -256,6 +256,8 @@ export const DEMO_SOURCE_BASE_URLS: Record<JobSource, string> = {
   adzuna: "https://www.adzuna.com",
   hiringcafe: "https://hiring.cafe",
   startupjobs: "https://startup.jobs",
+  workingnomads: "https://www.workingnomads.com",
+  golangjobs: "https://www.golangjobs.tech",
   manual: "https://example.com",
 };
 

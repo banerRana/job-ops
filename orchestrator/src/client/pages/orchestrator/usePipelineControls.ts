@@ -1,9 +1,7 @@
 import * as api from "@client/api";
+import type { ManualImportResult } from "@client/components/ManualImportFlow";
 import { useSettings } from "@client/hooks/useSettings";
-import {
-  formatCountryLabel,
-  getCompatibleSourcesForCountry,
-} from "@shared/location-support.js";
+import { getCompatibleSourcesForCountry } from "@shared/location-support.js";
 import type { AppSettings, JobSource } from "@shared/types.js";
 import { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
@@ -37,7 +35,7 @@ export type UsePipelineControlsResult = {
   openRunMode: (mode: RunMode) => void;
   handleCancelPipeline: () => Promise<void>;
   handleSaveAndRunAutomatic: (values: AutomaticRunValues) => Promise<void>;
-  handleManualImported: (importedJobId: string) => Promise<void>;
+  handleManualImported: (result: ManualImportResult) => Promise<void>;
   refreshSettings: () => Promise<AppSettings | null>;
 };
 
@@ -173,23 +171,7 @@ export function usePipelineControls(
         searchTerms: values.searchTerms,
         sources: compatibleSources,
       });
-      const hasJobSpySite = compatibleSources.some(
-        (source) =>
-          source === "indeed" ||
-          source === "linkedin" ||
-          source === "glassdoor",
-      );
-      const hasAdzuna = compatibleSources.includes("adzuna");
-      const hasHiringCafe = compatibleSources.includes("hiringcafe");
-      const hasStartupJobs = compatibleSources.includes("startupjobs");
-      const serializedCities = serializeCityLocationsSetting(
-        values.cityLocations,
-      );
-      const searchCities =
-        (hasJobSpySite || hasAdzuna || hasHiringCafe || hasStartupJobs) &&
-        serializedCities
-          ? serializedCities
-          : formatCountryLabel(values.country);
+      const searchCities = serializeCityLocationsSetting(values.cityLocations);
       await api.updateSettings({
         searchTerms: values.searchTerms,
         workplaceTypes: values.workplaceTypes,
@@ -219,12 +201,14 @@ export function usePipelineControls(
   );
 
   const handleManualImported = useCallback(
-    async (importedJobId: string) => {
+    async (imported: ManualImportResult) => {
       trackProductEvent("jobs_pipeline_run_started", {
         mode: "manual_import",
+        manual_import_source: imported.source,
+        manual_import_source_host: imported.sourceHost ?? undefined,
       });
       await loadJobs();
-      navigateWithContext("ready", importedJobId);
+      navigateWithContext("ready", imported.jobId);
     },
     [loadJobs, navigateWithContext],
   );

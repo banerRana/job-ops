@@ -1,3 +1,4 @@
+import { getDefaultPromptTemplate } from "@shared/prompt-template-definitions.js";
 import { createAppSettings } from "@shared/testing/factories.js";
 import { fireEvent, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -62,23 +63,59 @@ const renderPage = () => {
   );
 };
 
+const getSaveButton = () =>
+  screen.getByRole("button", { name: /save changes/i });
+
+const openNavGroup = async (name: RegExp) => {
+  const groupButton = await screen.findByRole("button", { name });
+  fireEvent.click(groupButton);
+};
+
+const clickLastButtonByName = async (name: RegExp) => {
+  const buttons = await screen.findAllByRole("button", { name });
+  const target = buttons.at(-1);
+  expect(target).toBeDefined();
+  fireEvent.click(target as HTMLElement);
+};
+
 const openModelSection = async () => {
-  const modelTrigger = await screen.findByRole("button", { name: /^model$/i });
-  fireEvent.click(modelTrigger);
+  await openNavGroup(/^ai$/i);
+  await clickLastButtonByName(/models/i);
 };
 
 const openWritingStyleSection = async () => {
-  const chatTrigger = await screen.findByRole("button", {
-    name: /writing style & language/i,
-  });
-  fireEvent.click(chatTrigger);
+  await openNavGroup(/^ai$/i);
+  await clickLastButtonByName(/writing style/i);
+};
+
+const openPromptTemplatesSection = async () => {
+  await openNavGroup(/^ai$/i);
+  await clickLastButtonByName(/prompt templates/i);
 };
 
 const openReactiveResumeSection = async () => {
-  const trigger = await screen.findByRole("button", {
-    name: /reactive resume/i,
-  });
-  fireEvent.click(trigger);
+  await openNavGroup(/^integrations$/i);
+  await clickLastButtonByName(/reactive resume/i);
+};
+
+const openDisplaySection = async () => {
+  await openNavGroup(/^display$/i);
+  await clickLastButtonByName(/display preferences/i);
+};
+
+const openEnvironmentSection = async () => {
+  await openNavGroup(/^accounts & security$/i);
+  await clickLastButtonByName(/accounts & access/i);
+};
+
+const openScoringSection = async () => {
+  await openNavGroup(/^scoring$/i);
+  await clickLastButtonByName(/rules.*filters/i);
+};
+
+const openDangerZoneSection = async () => {
+  await openNavGroup(/^danger zone$/i);
+  await clickLastButtonByName(/danger zone/i);
 };
 
 describe("SettingsPage", () => {
@@ -130,7 +167,7 @@ describe("SettingsPage", () => {
     await waitFor(() => expect(modelInput).toBeEnabled());
     fireEvent.change(modelInput, { target: { value: "  gpt-4  " } });
 
-    const saveButton = screen.getByRole("button", { name: /^save$/i });
+    const saveButton = getSaveButton();
     await waitFor(() => expect(saveButton).toBeEnabled());
 
     fireEvent.click(saveButton);
@@ -164,7 +201,7 @@ describe("SettingsPage", () => {
     ).toBeInTheDocument();
 
     // Save button should be disabled due to validation error (isValid will be false)
-    const saveButton = screen.getByRole("button", { name: /^save$/i });
+    const saveButton = getSaveButton();
     expect(saveButton).toBeDisabled();
   });
 
@@ -177,10 +214,7 @@ describe("SettingsPage", () => {
 
     renderPage();
 
-    const dangerTrigger = await screen.findByRole("button", {
-      name: /danger zone/i,
-    });
-    fireEvent.click(dangerTrigger);
+    await openDangerZoneSection();
 
     const clearSelectedButton = await screen.findByRole("button", {
       name: /clear selected/i,
@@ -206,7 +240,7 @@ describe("SettingsPage", () => {
   it("enables save button when model is changed", async () => {
     vi.mocked(api.getSettings).mockResolvedValue(baseSettings);
     renderPage();
-    const saveButton = screen.getByRole("button", { name: /^save$/i });
+    const saveButton = getSaveButton();
     expect(saveButton).toBeDisabled();
     await openModelSection();
 
@@ -246,7 +280,7 @@ describe("SettingsPage", () => {
     fireEvent.click(screen.getByRole("combobox", { name: /provider/i }));
     fireEvent.click(await screen.findByText("OpenAI"));
 
-    const saveButton = screen.getByRole("button", { name: /^save$/i });
+    const saveButton = getSaveButton();
     await waitFor(() => expect(saveButton).toBeEnabled());
     fireEvent.click(saveButton);
 
@@ -262,11 +296,114 @@ describe("SettingsPage", () => {
     );
   });
 
+  it("does not mark model settings dirty on initial load when provider comes from effective settings", async () => {
+    vi.mocked(api.getSettings).mockResolvedValue(baseSettings);
+
+    renderPage();
+    await openModelSection();
+
+    const saveButton = getSaveButton();
+    await waitFor(() => expect(saveButton).toBeDisabled());
+  });
+
+  it("does not mark Reactive Resume settings dirty when project catalog hydration finishes", async () => {
+    vi.mocked(api.validateRxresume).mockResolvedValue({
+      valid: true,
+      message: null,
+      status: 200,
+    });
+    vi.mocked(api.getRxResumeProjects).mockResolvedValue([
+      {
+        id: "proj-1",
+        name: "Project One",
+        description: "Desc 1",
+        date: "2024",
+        isVisibleInBase: true,
+      },
+    ]);
+    vi.mocked(api.getSettings).mockResolvedValue(
+      createAppSettings({
+        rxresumeApiKeyHint: "rr-v5",
+        rxresumeBaseResumeId: "resume-123",
+        profileProjects: [
+          {
+            id: "proj-1",
+            name: "Project One",
+            description: "Desc 1",
+            date: "2024",
+            isVisibleInBase: true,
+          },
+        ],
+      }),
+    );
+
+    renderPage();
+    await openReactiveResumeSection();
+
+    await waitFor(() => expect(api.getRxResumeProjects).toHaveBeenCalled());
+
+    const saveButton = getSaveButton();
+    await waitFor(() => expect(saveButton).toBeDisabled());
+  });
+
+  it("does not clear the model override when saving an unrelated setting", async () => {
+    vi.mocked(api.getSettings).mockResolvedValue(
+      createAppSettings({
+        model: {
+          value: "gpt-4.1-mini",
+          default: "gpt-4o",
+          override: "gpt-4.1-mini",
+        },
+        llmProvider: {
+          value: "openai",
+          default: "openai",
+          override: null,
+        },
+      }),
+    );
+    vi.mocked(api.updateSettings).mockResolvedValue(
+      createAppSettings({
+        model: {
+          value: "gpt-4.1-mini",
+          default: "gpt-4o",
+          override: "gpt-4.1-mini",
+        },
+        llmProvider: {
+          value: "openai",
+          default: "openai",
+          override: null,
+        },
+        showSponsorInfo: {
+          value: false,
+          default: true,
+          override: false,
+        },
+      }),
+    );
+
+    renderPage();
+
+    await openDisplaySection();
+    fireEvent.click(screen.getByLabelText(/show visa sponsor information/i));
+
+    const saveButton = getSaveButton();
+    await waitFor(() => expect(saveButton).toBeEnabled());
+    fireEvent.click(saveButton);
+
+    await waitFor(() => expect(api.updateSettings).toHaveBeenCalled());
+    expect(api.updateSettings).toHaveBeenCalledWith(
+      expect.objectContaining({
+        model: "gpt-4.1-mini",
+        showSponsorInfo: false,
+      }),
+    );
+  });
+
   it("hides pipeline tuning sections that moved to run modal", async () => {
     vi.mocked(api.getSettings).mockResolvedValue(baseSettings);
     renderPage();
 
-    await screen.findByRole("button", { name: /model/i });
+    await openModelSection();
     expect(
       screen.queryByRole("button", { name: /ukvisajobs extractor/i }),
     ).not.toBeInTheDocument();
@@ -284,12 +421,9 @@ describe("SettingsPage", () => {
   it("enables save button when display setting is changed", async () => {
     vi.mocked(api.getSettings).mockResolvedValue(baseSettings);
     renderPage();
-    const saveButton = screen.getByRole("button", { name: /^save$/i });
+    const saveButton = getSaveButton();
 
-    const displayTrigger = await screen.findByRole("button", {
-      name: /display settings/i,
-    });
-    fireEvent.click(displayTrigger);
+    await openDisplaySection();
     const sponsorCheckbox = screen.getByLabelText(
       /show visa sponsor information/i,
     );
@@ -297,29 +431,22 @@ describe("SettingsPage", () => {
     await waitFor(() => expect(saveButton).toBeEnabled());
   });
 
-  it("allows saving when both Reactive Resume v4 and v5 credentials are present", async () => {
-    const settingsWithBothRxResumeAuth = createAppSettings({
-      rxresumeEmail: "resume@example.com",
-      rxresumePasswordHint: "pass",
+  it("allows saving when Reactive Resume credentials are present", async () => {
+    const settingsWithRxResumeAuth = createAppSettings({
       rxresumeApiKeyHint: "api_",
     });
-    vi.mocked(api.getSettings).mockResolvedValue(settingsWithBothRxResumeAuth);
-    vi.mocked(api.updateSettings).mockResolvedValue(
-      settingsWithBothRxResumeAuth,
-    );
+    vi.mocked(api.getSettings).mockResolvedValue(settingsWithRxResumeAuth);
+    vi.mocked(api.updateSettings).mockResolvedValue(settingsWithRxResumeAuth);
 
     renderPage();
 
-    const displayTrigger = await screen.findByRole("button", {
-      name: /display settings/i,
-    });
-    fireEvent.click(displayTrigger);
+    await openDisplaySection();
     const sponsorCheckbox = screen.getByLabelText(
       /show visa sponsor information/i,
     );
     fireEvent.click(sponsorCheckbox);
 
-    const saveButton = screen.getByRole("button", { name: /^save$/i });
+    const saveButton = getSaveButton();
     await waitFor(() => expect(saveButton).toBeEnabled());
     fireEvent.click(saveButton);
 
@@ -339,18 +466,14 @@ describe("SettingsPage", () => {
 
     renderPage();
 
-    const reactiveResumeTrigger = await screen.findByRole("button", {
-      name: /reactive resume/i,
-    });
-    fireEvent.click(reactiveResumeTrigger);
-
+    await openReactiveResumeSection();
     const urlInput = screen.getByLabelText(/rxresume url/i);
     await waitFor(() => expect(urlInput).toBeEnabled());
     fireEvent.change(urlInput, {
       target: { value: "https://resume.example.com" },
     });
 
-    const saveButton = screen.getByRole("button", { name: /^save$/i });
+    const saveButton = getSaveButton();
     await waitFor(() => expect(saveButton).toBeEnabled());
     fireEvent.click(saveButton);
 
@@ -381,7 +504,7 @@ describe("SettingsPage", () => {
       target: { value: "invalid-v5-key" },
     });
 
-    const saveButton = screen.getByRole("button", { name: /^save$/i });
+    const saveButton = getSaveButton();
     await waitFor(() => expect(saveButton).toBeEnabled());
     fireEvent.click(saveButton);
 
@@ -414,7 +537,7 @@ describe("SettingsPage", () => {
       target: { value: "rr-v5-warning-key" },
     });
 
-    const saveButton = screen.getByRole("button", { name: /^save$/i });
+    const saveButton = getSaveButton();
     await waitFor(() => expect(saveButton).toBeEnabled());
     fireEvent.click(saveButton);
 
@@ -448,7 +571,7 @@ describe("SettingsPage", () => {
       target: { value: "new-model" },
     });
 
-    const saveButton = screen.getByRole("button", { name: /^save$/i });
+    const saveButton = getSaveButton();
     await waitFor(() => expect(saveButton).toBeEnabled());
     fireEvent.click(saveButton);
 
@@ -505,7 +628,7 @@ describe("SettingsPage", () => {
       screen.queryByRole("combobox", { name: /specific language/i }),
     ).not.toBeInTheDocument();
 
-    const saveButton = screen.getByRole("button", { name: /^save$/i });
+    const saveButton = getSaveButton();
     await waitFor(() => expect(saveButton).toBeEnabled());
     fireEvent.click(saveButton);
 
@@ -518,22 +641,19 @@ describe("SettingsPage", () => {
     );
   });
 
-  it("enables save button when basic auth toggle is changed", async () => {
+  it("enables save button when the authentication toggle is changed", async () => {
     vi.mocked(api.getSettings).mockResolvedValue(baseSettings);
     renderPage();
-    const saveButton = screen.getByRole("button", { name: /^save$/i });
+    const saveButton = getSaveButton();
 
-    const envTrigger = await screen.findByRole("button", {
-      name: /environment & accounts/i,
-    });
-    fireEvent.click(envTrigger);
-    const authCheckbox = screen.getByLabelText(/enable basic authentication/i);
+    await openEnvironmentSection();
+    const authCheckbox = screen.getByLabelText(/enable authentication/i);
     fireEvent.click(authCheckbox);
     expect(saveButton).toBeEnabled();
   });
 
-  it("wipes basic auth credentials when toggle is disabled and saved", async () => {
-    // Initial state: Basic Auth is active
+  it("wipes auth credentials when the toggle is disabled and saved", async () => {
+    // Initial state: authentication is active
     const activeSettings = {
       ...baseSettings,
       basicAuthActive: true,
@@ -545,19 +665,16 @@ describe("SettingsPage", () => {
 
     renderPage();
 
-    const envTrigger = await screen.findByRole("button", {
-      name: /environment & accounts/i,
-    });
-    fireEvent.click(envTrigger);
+    await openEnvironmentSection();
 
-    const authCheckbox = screen.getByLabelText(/enable basic authentication/i);
+    const authCheckbox = screen.getByLabelText(/enable authentication/i);
     expect(authCheckbox).toBeChecked();
 
     // Disable it
     fireEvent.click(authCheckbox);
     expect(authCheckbox).not.toBeChecked();
 
-    const saveButton = screen.getByRole("button", { name: /^save$/i });
+    const saveButton = getSaveButton();
     expect(saveButton).toBeEnabled();
     fireEvent.click(saveButton);
 
@@ -583,16 +700,13 @@ describe("SettingsPage", () => {
 
     renderPage();
 
-    const scoringTrigger = await screen.findByRole("button", {
-      name: /scoring settings/i,
-    });
-    fireEvent.click(scoringTrigger);
+    await openScoringSection();
 
     const input = screen.getByPlaceholderText('e.g. "recruitment", "staffing"');
     fireEvent.change(input, { target: { value: "staffing" } });
     fireEvent.keyDown(input, { key: "Enter" });
 
-    const saveButton = screen.getByRole("button", { name: /^save$/i });
+    const saveButton = getSaveButton();
     await waitFor(() => expect(saveButton).toBeEnabled());
     fireEvent.click(saveButton);
 
@@ -600,6 +714,69 @@ describe("SettingsPage", () => {
     expect(api.updateSettings).toHaveBeenCalledWith(
       expect.objectContaining({
         blockedCompanyKeywords: ["staffing"],
+      }),
+    );
+  });
+
+  it("saves auto-skip score threshold from scoring settings", async () => {
+    vi.mocked(api.getSettings).mockResolvedValue(baseSettings);
+    vi.mocked(api.updateSettings).mockResolvedValue({
+      ...baseSettings,
+      autoSkipScoreThreshold: {
+        value: 42,
+        default: null,
+        override: 42,
+      },
+    });
+
+    renderPage();
+
+    await openScoringSection();
+
+    const input = screen.getByLabelText(/auto-skip score threshold/i);
+    fireEvent.change(input, { target: { value: "42" } });
+
+    const saveButton = getSaveButton();
+    await waitFor(() => expect(saveButton).toBeEnabled());
+    fireEvent.click(saveButton);
+
+    await waitFor(() => expect(api.updateSettings).toHaveBeenCalled());
+    expect(api.updateSettings).toHaveBeenCalledWith(
+      expect.objectContaining({
+        autoSkipScoreThreshold: 42,
+      }),
+    );
+  });
+
+  it("sends null for both numeric limit fields on reset-to-default", async () => {
+    vi.mocked(api.getSettings).mockResolvedValue(
+      createAppSettings({
+        chatStyleSummaryMaxWords: {
+          value: 35,
+          default: null,
+          override: 35,
+        },
+        chatStyleMaxKeywordsPerSkill: {
+          value: 8,
+          default: null,
+          override: 8,
+        },
+      }),
+    );
+    vi.mocked(api.updateSettings).mockResolvedValue(baseSettings);
+
+    renderPage();
+
+    const resetButton = await screen.findByRole("button", {
+      name: /reset to default/i,
+    });
+    fireEvent.click(resetButton);
+
+    await waitFor(() => expect(api.updateSettings).toHaveBeenCalled());
+    expect(api.updateSettings).toHaveBeenCalledWith(
+      expect.objectContaining({
+        chatStyleSummaryMaxWords: null,
+        chatStyleMaxKeywordsPerSkill: null,
       }),
     );
   });
@@ -619,10 +796,7 @@ describe("SettingsPage", () => {
 
     renderPage();
 
-    const scoringTrigger = await screen.findByRole("button", {
-      name: /scoring settings/i,
-    });
-    fireEvent.click(scoringTrigger);
+    await openScoringSection();
 
     const textarea = screen.getByLabelText(/scoring instructions/i);
     fireEvent.change(textarea, {
@@ -632,7 +806,7 @@ describe("SettingsPage", () => {
       },
     });
 
-    const saveButton = screen.getByRole("button", { name: /^save$/i });
+    const saveButton = getSaveButton();
     await waitFor(() => expect(saveButton).toBeEnabled());
     fireEvent.click(saveButton);
 
@@ -641,6 +815,36 @@ describe("SettingsPage", () => {
       expect.objectContaining({
         scoringInstructions:
           "Open to relocating, so do not mark down for location discrepancies.",
+      }),
+    );
+  });
+
+  it("serializes prompt templates back to null when reset to defaults", async () => {
+    vi.mocked(api.getSettings).mockResolvedValue(
+      createAppSettings({
+        ghostwriterSystemPromptTemplate: {
+          value: "Custom Ghostwriter",
+          default: getDefaultPromptTemplate("ghostwriterSystemPromptTemplate"),
+          override: "Custom Ghostwriter",
+        },
+      }),
+    );
+    vi.mocked(api.updateSettings).mockResolvedValue(baseSettings);
+
+    renderPage();
+
+    await openPromptTemplatesSection();
+
+    fireEvent.click(screen.getAllByRole("button", { name: /^reset$/i })[0]);
+
+    const saveButton = getSaveButton();
+    await waitFor(() => expect(saveButton).toBeEnabled());
+    fireEvent.click(saveButton);
+
+    await waitFor(() => expect(api.updateSettings).toHaveBeenCalled());
+    expect(api.updateSettings).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ghostwriterSystemPromptTemplate: null,
       }),
     );
   });

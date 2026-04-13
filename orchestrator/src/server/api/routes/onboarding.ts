@@ -1,8 +1,10 @@
-import { ok, okWithMeta } from "@infra/http";
+import { asyncRoute, ok, okWithMeta } from "@infra/http";
 import { logger } from "@infra/logger";
 import { isDemoMode } from "@server/config/demo";
 import { getSetting } from "@server/repositories/settings";
+import { getDesignResumeStatus } from "@server/services/design-resume";
 import { LlmService } from "@server/services/llm/service";
+import { suggestOnboardingSearchTerms } from "@server/services/onboarding-search-terms";
 import {
   getResume,
   RxResumeAuthConfigError,
@@ -84,6 +86,11 @@ function normalizeLlmProviderValue(
  */
 async function validateResumeConfig(): Promise<ValidationResponse> {
   try {
+    const localStatus = await getDesignResumeStatus();
+    if (localStatus.exists) {
+      return { valid: true, message: null };
+    }
+
     // Check if rxresumeBaseResumeId is configured
     const { resumeId: rxresumeBaseResumeId } =
       await getConfiguredRxResumeBaseResumeId();
@@ -92,7 +99,7 @@ async function validateResumeConfig(): Promise<ValidationResponse> {
       return {
         valid: false,
         message:
-          "No base resume selected. Please select a resume from your RxResume account in Settings.",
+          "No local resume is ready yet. Upload a PDF or DOCX resume, or connect Reactive Resume and select a template resume.",
       };
     }
 
@@ -134,55 +141,23 @@ async function validateResumeConfig(): Promise<ValidationResponse> {
 }
 
 async function validateRxresume(options?: {
-  mode?: string | null;
-  email?: string | null;
-  password?: string | null;
   apiKey?: string | null;
   baseUrl?: string | null;
 }): Promise<ValidationResponse> {
-  const rawMode = options?.mode?.trim();
-  const explicitMode = rawMode === "v4" || rawMode === "v5" ? rawMode : null;
-  const requestEmail = options?.email?.trim() ?? "";
-  const requestPassword = options?.password?.trim() ?? "";
   const requestApiKey = options?.apiKey?.trim() ?? "";
-  const hasExplicitV4Input =
-    options?.email !== undefined || options?.password !== undefined;
   const hasExplicitV5Input = options?.apiKey !== undefined;
-  const storedModeRaw = (await getSetting("rxresumeMode"))?.trim();
-  const storedMode =
-    storedModeRaw === "v4" || storedModeRaw === "v5"
-      ? storedModeRaw
-      : undefined;
-  const inferredMode =
-    explicitMode ??
-    (hasExplicitV5Input
-      ? "v5"
-      : hasExplicitV4Input
-        ? "v4"
-        : storedMode === "v4"
-          ? "v4"
-          : "v5");
+
   const storedBaseUrl = await getSetting("rxresumeUrl");
   const resolvedBaseUrl =
     options?.baseUrl !== undefined && options?.baseUrl !== null
       ? options.baseUrl.trim() ||
         process.env.RXRESUME_URL?.trim() ||
-        (inferredMode === "v4" ? "https://v4.rxresu.me" : "https://rxresu.me")
+        "https://rxresu.me"
       : storedBaseUrl?.trim() ||
         process.env.RXRESUME_URL?.trim() ||
-        (inferredMode === "v4" ? "https://v4.rxresu.me" : "https://rxresu.me");
+        "https://rxresu.me";
 
-  if (inferredMode === "v4" && hasExplicitV4Input) {
-    if (!requestEmail || !requestPassword) {
-      return {
-        valid: false,
-        status: 400,
-        message: "Reactive Resume v4 credentials are not configured.",
-      };
-    }
-  }
-
-  if (inferredMode === "v5" && hasExplicitV5Input && !requestApiKey) {
+  if (hasExplicitV5Input && !requestApiKey) {
     return {
       valid: false,
       status: 400,
@@ -191,12 +166,6 @@ async function validateRxresume(options?: {
   }
 
   const result = await validateRxResumeCredentials({
-    mode: inferredMode,
-    v4: {
-      email: options?.email ?? undefined,
-      password: options?.password ?? undefined,
-      baseUrl: options?.baseUrl ?? undefined,
-    },
     v5: {
       apiKey: options?.apiKey ?? undefined,
       baseUrl: options?.baseUrl ?? undefined,
@@ -222,9 +191,7 @@ async function validateRxresume(options?: {
       valid: false,
       status: result.status,
       message:
-        inferredMode === "v4"
-          ? "Reactive Resume v4 email/password is invalid. Update the email/password and try again."
-          : "Reactive Resume v5 API key is invalid. Update the API key and try again.",
+        "Reactive Resume v5 API key is invalid. Update the API key and try again.",
     };
   }
 
@@ -240,7 +207,7 @@ async function validateRxresume(options?: {
     return {
       valid: false,
       status: result.status,
-      message: `Reactive Resume returned HTTP ${result.status} from ${resolvedBaseUrl}. Check the configured URL and selected mode.`,
+      message: `Reactive Resume returned HTTP ${result.status} from ${resolvedBaseUrl}. Check the configured URL.`,
     };
   }
 
@@ -269,7 +236,7 @@ onboardingRouter.post(
     const apiKey =
       typeof req.body?.apiKey === "string" ? req.body.apiKey : undefined;
     const result = await validateLlm({ apiKey, provider: "openrouter" });
-    res.json({ success: true, data: result });
+    ok(res, result);
   },
 );
 
@@ -292,7 +259,7 @@ onboardingRouter.post("/validate/llm", async (req: Request, res: Response) => {
   const baseUrl =
     typeof req.body?.baseUrl === "string" ? req.body.baseUrl : undefined;
   const result = await validateLlm({ apiKey, provider, baseUrl });
-  res.json({ success: true, data: result });
+  ok(res, result);
 });
 
 onboardingRouter.post(
@@ -309,19 +276,11 @@ onboardingRouter.post(
       );
     }
 
-    const email =
-      typeof req.body?.email === "string" ? req.body.email : undefined;
-    const password =
-      typeof req.body?.password === "string" ? req.body.password : undefined;
-    const mode = typeof req.body?.mode === "string" ? req.body.mode : undefined;
     const apiKey =
       typeof req.body?.apiKey === "string" ? req.body.apiKey : undefined;
     const baseUrl =
       typeof req.body?.baseUrl === "string" ? req.body.baseUrl : undefined;
     const result = await validateRxresume({
-      mode,
-      email,
-      password,
       apiKey,
       baseUrl,
     });
@@ -346,4 +305,29 @@ onboardingRouter.get(
     const result = await validateResumeConfig();
     ok(res, result);
   },
+);
+
+onboardingRouter.post(
+  "/search-terms/suggest",
+  asyncRoute(async (_req: Request, res: Response) => {
+    if (isDemoMode()) {
+      return okWithMeta(
+        res,
+        {
+          terms: [
+            "Product Engineer",
+            "Full Stack Engineer",
+            "Frontend Engineer",
+            "Backend Engineer",
+            "Software Engineer",
+          ],
+          source: "fallback",
+        },
+        { simulated: true },
+      );
+    }
+
+    const result = await suggestOnboardingSearchTerms();
+    ok(res, result);
+  }),
 );

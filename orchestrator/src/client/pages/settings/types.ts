@@ -29,17 +29,18 @@ export type ChatValues = {
   doNotUse: EffectiveDefault<string>;
   languageMode: EffectiveDefault<ChatStyleLanguageMode>;
   manualLanguage: EffectiveDefault<ChatStyleManualLanguage>;
+  summaryMaxWords: EffectiveDefault<number | null>;
+  maxKeywordsPerSkill: EffectiveDefault<number | null>;
 };
 
 export type EnvSettingsValues = {
   readable: {
-    rxresumeEmail: string;
     ukvisajobsEmail: string;
     adzunaAppId: string;
     basicAuthUser: string;
+    basicAuthPassword: string;
   };
   private: {
-    rxresumePasswordHint: string | null;
     ukvisajobsPasswordHint: string | null;
     adzunaAppKeyHint: string | null;
     basicAuthPasswordHint: string | null;
@@ -60,4 +61,10 @@ export type ScoringValues = {
   autoSkipScoreThreshold: EffectiveDefault<number | null>;
   blockedCompanyKeywords: EffectiveDefault<string[]>;
   scoringInstructions: EffectiveDefault<string>;
+};
+
+export type PromptTemplatesValues = {
+  ghostwriterSystemPromptTemplate: EffectiveDefault<string>;
+  tailoringPromptTemplate: EffectiveDefault<string>;
+  scoringPromptTemplate: EffectiveDefault<string>;
 };

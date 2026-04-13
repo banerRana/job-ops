@@ -73,9 +73,17 @@ export const defaultStatusToken = {
   dot: "bg-muted-foreground",
 };
 
+export const appliedDuplicateIndicator = {
+  label: "Previously Applied",
+  dot: "bg-yellow-400",
+};
+
 export type FilterTab = "ready" | "discovered" | "applied" | "all";
+export type DateFilterPreset = "7" | "14" | "30" | "90" | "custom";
+export type DateFilterDimension = "ready" | "applied" | "closed" | "discovered";
 
 export type SortKey =
+  | "date"
   | "discoveredAt"
   | "score"
   | "salary"
@@ -99,11 +107,26 @@ export interface SalaryFilter {
 export interface JobSort {
   key: SortKey;
   direction: SortDirection;
+  datePriority?: DateFilterDimension[];
+}
+
+export interface JobDateFilter {
+  dimensions: DateFilterDimension[];
+  startDate: string | null;
+  endDate: string | null;
+  preset: DateFilterPreset | null;
 }
 
 export const DEFAULT_SORT: JobSort = { key: "score", direction: "desc" };
+export const DEFAULT_DATE_FILTER: JobDateFilter = {
+  dimensions: [],
+  startDate: null,
+  endDate: null,
+  preset: null,
+};
 
 export const sortLabels: Record<JobSort["key"], string> = {
+  date: "Date",
   discoveredAt: "Discovered",
   score: "Score",
   salary: "Salary",
@@ -112,6 +135,7 @@ export const sortLabels: Record<JobSort["key"], string> = {
 };
 
 export const defaultSortDirection: Record<JobSort["key"], SortDirection> = {
+  date: "desc",
   discoveredAt: "desc",
   score: "desc",
   salary: "desc",
@@ -140,3 +164,17 @@ export const emptyStateCopy: Record<FilterTab, string> = {
   applied: "You have not applied to any jobs yet.",
   all: "No jobs in the system yet. Run the pipeline to get started.",
 };
+
+export const dateFilterDimensionLabels: Record<DateFilterDimension, string> = {
+  ready: "Ready",
+  applied: "Applied",
+  closed: "Closed",
+  discovered: "Discovered",
+};
+
+export const dateFilterDimensionOrder: DateFilterDimension[] = [
+  "ready",
+  "applied",
+  "closed",
+  "discovered",
+];

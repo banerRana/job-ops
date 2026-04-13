@@ -1,10 +1,12 @@
 import { createJob } from "@shared/testing/factories.js";
 import type { Job } from "@shared/types.js";
 import { fireEvent, screen, waitFor } from "@testing-library/react";
+import { forwardRef, useImperativeHandle } from "react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { toast } from "sonner";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import * as api from "../api";
+import { _resetKeyboardAvailabilityForTests } from "../hooks/useKeyboardAvailability";
 import { renderWithQueryClient } from "../test/renderWithQueryClient";
 import { OrchestratorPage } from "./OrchestratorPage";
 import type { AutomaticRunValues } from "./orchestrator/automatic-run";
@@ -65,6 +67,7 @@ let mockAutomaticRunValues: AutomaticRunValues = {
   cityLocations: [],
   workplaceTypes: ["remote", "hybrid", "onsite"],
 };
+const mockJobListScrollToIndex = vi.fn();
 
 const jobFixture = createJob({
   id: "job-1",
@@ -99,9 +102,9 @@ const processingJob = createJob({
 let mockJobs = [jobFixture, job2, processingJob];
 let mockSelectedJob: Job | null = jobFixture;
 
-const createMatchMedia = (matches: boolean) =>
+const createMatchMedia = (matches: boolean | Record<string, boolean>) =>
   vi.fn().mockImplementation((query: string) => ({
-    matches,
+    matches: typeof matches === "boolean" ? matches : (matches[query] ?? false),
     media: query,
     addEventListener: vi.fn(),
     removeEventListener: vi.fn(),
@@ -207,6 +210,7 @@ vi.mock("./orchestrator/OrchestratorFilters", () => ({
     onSourceFilterChange,
     onSponsorFilterChange,
     onSalaryFilterChange,
+    onDateFilterChange,
     onResetFilters,
     onSortChange,
     sourcesWithJobs,
@@ -220,6 +224,12 @@ vi.mock("./orchestrator/OrchestratorFilters", () => ({
       mode: "at_least" | "at_most" | "between";
       min: number | null;
       max: number | null;
+    }) => void;
+    onDateFilterChange: (value: {
+      dimensions: Array<"ready" | "applied" | "closed" | "discovered">;
+      startDate: string | null;
+      endDate: string | null;
+      preset: "7" | "14" | "30" | "90" | "custom" | null;
     }) => void;
     onResetFilters: () => void;
     onSortChange: (s: any) => void;
@@ -259,6 +269,19 @@ vi.mock("./orchestrator/OrchestratorFilters", () => ({
       >
         Set Salary Range
       </button>
+      <button
+        type="button"
+        onClick={() =>
+          onDateFilterChange({
+            dimensions: ["applied"],
+            startDate: "2026-04-01",
+            endDate: "2026-04-08",
+            preset: "custom",
+          })
+        }
+      >
+        Set Date Filter
+      </button>
       <button type="button" onClick={onResetFilters}>
         Reset Filters
       </button>
@@ -267,76 +290,96 @@ vi.mock("./orchestrator/OrchestratorFilters", () => ({
 }));
 
 vi.mock("./orchestrator/JobDetailPanel", () => ({
-  JobDetailPanel: () => <div data-testid="detail-panel" />,
+  JobDetailPanel: ({ selectedJob }: { selectedJob: Job | null }) => (
+    <div data-testid="detail-panel">
+      {selectedJob?.appliedDuplicateMatch ? "Previously Applied" : "No match"}
+    </div>
+  ),
 }));
 
 vi.mock("./orchestrator/JobListPanel", () => ({
-  JobListPanel: ({
-    onSelectJob,
-    onToggleSelectJob,
-    onToggleSelectAll,
-    selectedJobId,
-  }: {
-    onSelectJob: (id: string) => void;
-    onToggleSelectJob: (id: string) => void;
-    onToggleSelectAll: (checked: boolean) => void;
-    selectedJobId: string | null;
-  }) => (
-    <div>
-      <div data-job-id="job-1" />
-      <div data-job-id="job-2" />
-      <div data-job-id="job-3" />
-      <div data-testid="selected-job">{selectedJobId ?? "none"}</div>
-      <button
-        data-testid="toggle-select-all-on"
-        type="button"
-        onClick={() => onToggleSelectAll(true)}
-      >
-        Toggle all on
-      </button>
-      <button
-        data-testid="toggle-select-all-off"
-        type="button"
-        onClick={() => onToggleSelectAll(false)}
-      >
-        Toggle all off
-      </button>
-      <button
-        data-testid="toggle-select-job-1"
-        type="button"
-        onClick={() => onToggleSelectJob("job-1")}
-      >
-        Toggle job 1
-      </button>
-      <button
-        data-testid="toggle-select-job-3"
-        type="button"
-        onClick={() => onToggleSelectJob("job-3")}
-      >
-        Toggle job 3
-      </button>
-      <button
-        data-testid="select-job-1"
-        type="button"
-        onClick={() => onSelectJob("job-1")}
-      >
-        Select job 1
-      </button>
-      <button
-        data-testid="select-job-2"
-        type="button"
-        onClick={() => onSelectJob("job-2")}
-      >
-        Select job 2
-      </button>
-      <button
-        data-testid="select-job-3"
-        type="button"
-        onClick={() => onSelectJob("job-3")}
-      >
-        Select job 3
-      </button>
-    </div>
+  JobListPanel: forwardRef(
+    (
+      {
+        activeJobs,
+        onSelectJob,
+        onToggleSelectJob,
+        onToggleSelectAll,
+        selectedJobId,
+      }: {
+        onSelectJob: (id: string) => void;
+        onToggleSelectJob: (id: string) => void;
+        onToggleSelectAll: (checked: boolean) => void;
+        selectedJobId: string | null;
+        activeJobs: Job[];
+      },
+      ref,
+    ) => {
+      useImperativeHandle(ref, () => ({
+        scrollToIndex: mockJobListScrollToIndex,
+      }));
+
+      return (
+        <div>
+          <div data-job-id="job-1" />
+          <div data-job-id="job-2" />
+          <div data-job-id="job-3" />
+          <div data-testid="selected-job">{selectedJobId ?? "none"}</div>
+          <div data-testid="duplicate-count">
+            {activeJobs.filter((job) => job.appliedDuplicateMatch).length}
+          </div>
+          <button
+            data-testid="toggle-select-all-on"
+            type="button"
+            onClick={() => onToggleSelectAll(true)}
+          >
+            Toggle all on
+          </button>
+          <button
+            data-testid="toggle-select-all-off"
+            type="button"
+            onClick={() => onToggleSelectAll(false)}
+          >
+            Toggle all off
+          </button>
+          <button
+            data-testid="toggle-select-job-1"
+            type="button"
+            onClick={() => onToggleSelectJob("job-1")}
+          >
+            Toggle job 1
+          </button>
+          <button
+            data-testid="toggle-select-job-3"
+            type="button"
+            onClick={() => onToggleSelectJob("job-3")}
+          >
+            Toggle job 3
+          </button>
+          <button
+            data-testid="select-job-1"
+            type="button"
+            onClick={() => onSelectJob("job-1")}
+          >
+            Select job 1
+          </button>
+          <button
+            data-testid="select-job-2"
+            type="button"
+            onClick={() => onSelectJob("job-2")}
+          >
+            Select job 2
+          </button>
+          <button
+            data-testid="select-job-3"
+            type="button"
+            onClick={() => onSelectJob("job-3")}
+          >
+            Select job 3
+          </button>
+        </div>
+      );
+    },
   ),
 }));
 
@@ -388,6 +431,7 @@ const pressKeyOn = (
 describe("OrchestratorPage", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    _resetKeyboardAvailabilityForTests();
     localStorage.clear();
     localStorage.setItem("has-seen-keyboard-shortcuts", "true");
     mockDemoMode = false;
@@ -484,6 +528,46 @@ describe("OrchestratorPage", () => {
     });
   });
 
+  it("surfaces applied duplicate warnings for reposted jobs in the orchestrator flow", () => {
+    const appliedJob = createJob({
+      id: "job-applied",
+      status: "applied",
+      appliedAt: "2026-04-01T10:00:00.000Z",
+    });
+    const repostedJob = createJob({
+      id: "job-1",
+      status: "ready",
+      appliedDuplicateMatch: {
+        jobId: "job-applied",
+        title: appliedJob.title,
+        employer: appliedJob.employer,
+        appliedAt: "2026-04-01T10:00:00.000Z",
+        score: 96,
+        titleScore: 97,
+        employerScore: 95,
+      },
+    });
+    mockJobs = [repostedJob, appliedJob, processingJob];
+    mockSelectedJob = repostedJob;
+    window.matchMedia = createMatchMedia(
+      true,
+    ) as unknown as typeof window.matchMedia;
+
+    render(
+      <MemoryRouter initialEntries={["/jobs/ready/job-1"]}>
+        <Routes>
+          <Route path="/jobs/:tab" element={<OrchestratorPage />} />
+          <Route path="/jobs/:tab/:jobId" element={<OrchestratorPage />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByTestId("duplicate-count")).toHaveTextContent("1");
+    expect(screen.getByTestId("detail-panel")).toHaveTextContent(
+      "Previously Applied",
+    );
+  });
+
   it("preserves the selected job id when a refresh temporarily excludes it", async () => {
     window.matchMedia = createMatchMedia(
       true,
@@ -574,6 +658,13 @@ describe("OrchestratorPage", () => {
       expect(locationText).not.toContain("salaryMax=");
       expect(locationText).not.toContain("q=");
     });
+    expect(mockJobListScrollToIndex).toHaveBeenCalledWith(
+      0,
+      expect.objectContaining({
+        align: "center",
+        behavior: "smooth",
+      }),
+    );
   });
 
   it("removes legacy q query params on load", async () => {
@@ -655,6 +746,20 @@ describe("OrchestratorPage", () => {
       "salaryMax=90000",
     );
 
+    fireEvent.click(screen.getByText("Set Date Filter"));
+    expect(screen.getByTestId("location").textContent).toContain(
+      "date=applied",
+    );
+    expect(screen.getByTestId("location").textContent).toContain(
+      "appliedStart=2026-04-01",
+    );
+    expect(screen.getByTestId("location").textContent).toContain(
+      "appliedEnd=2026-04-08",
+    );
+    expect(screen.getByTestId("location").textContent).toContain(
+      "appliedRange=custom",
+    );
+
     fireEvent.click(screen.getByText("Set Sort"));
     expect(screen.getByTestId("location").textContent).toContain(
       "sort=title-asc",
@@ -667,7 +772,59 @@ describe("OrchestratorPage", () => {
     expect(locationText).not.toContain("salaryMode=");
     expect(locationText).not.toContain("salaryMin=");
     expect(locationText).not.toContain("salaryMax=");
+    expect(locationText).not.toContain("date=");
+    expect(locationText).not.toContain("appliedStart=");
+    expect(locationText).not.toContain("appliedEnd=");
+    expect(locationText).not.toContain("appliedRange=");
     expect(locationText).not.toContain("sort=");
+  });
+
+  it("filters all jobs by the selected date filter and updates the query params", () => {
+    window.matchMedia = createMatchMedia(
+      true,
+    ) as unknown as typeof window.matchMedia;
+
+    mockJobs = [
+      createJob({
+        ...jobFixture,
+        id: "job-1",
+        status: "applied",
+        appliedAt: "2026-04-05T14:00:00.000Z",
+      }),
+      createJob({
+        ...jobFixture,
+        id: "job-2",
+        status: "in_progress",
+        appliedAt: "2026-04-04T14:00:00.000Z",
+      }),
+      createJob({
+        ...jobFixture,
+        id: "job-3",
+        status: "in_progress",
+        appliedAt: "2026-03-01T14:00:00.000Z",
+        closedAt: 1741996800,
+      }),
+    ];
+    mockSelectedJob = mockJobs[0];
+
+    render(
+      <MemoryRouter initialEntries={["/jobs/all"]}>
+        <LocationWatcher />
+        <Routes>
+          <Route path="/jobs/:tab" element={<OrchestratorPage />} />
+          <Route path="/jobs/:tab/:jobId" element={<OrchestratorPage />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByTestId("filtered-count")).toHaveTextContent("2");
+
+    fireEvent.click(screen.getByText("Set Date Filter"));
+
+    expect(screen.getByTestId("location").textContent).toContain(
+      "date=applied",
+    );
+    expect(screen.getByTestId("filtered-count")).toHaveTextContent("2");
   });
 
   it("opens the detail drawer on mobile when a job is selected", () => {
@@ -758,7 +915,7 @@ describe("OrchestratorPage", () => {
         adzunaMaxJobsPerTerm: 150,
         startupjobsMaxJobsPerTerm: 150,
         jobspyCountryIndeed: "united kingdom",
-        searchCities: "United Kingdom",
+        searchCities: null,
       });
     });
     expect(api.runPipeline).toHaveBeenCalledWith({
@@ -1040,11 +1197,25 @@ describe("OrchestratorPage", () => {
     await waitFor(() => {
       expect(screen.getByTestId("selected-job")).toHaveTextContent("job-2");
     });
+    expect(mockJobListScrollToIndex).toHaveBeenCalledWith(
+      1,
+      expect.objectContaining({
+        align: "center",
+        behavior: "smooth",
+      }),
+    );
 
     pressKey("k");
     await waitFor(() => {
       expect(screen.getByTestId("selected-job")).toHaveTextContent("job-1");
     });
+    expect(mockJobListScrollToIndex).toHaveBeenLastCalledWith(
+      0,
+      expect.objectContaining({
+        align: "center",
+        behavior: "smooth",
+      }),
+    );
 
     pressKey("2");
     await waitFor(() => {
@@ -1152,6 +1323,47 @@ describe("OrchestratorPage", () => {
     );
 
     expect(screen.getByTestId("help-dialog")).toHaveTextContent("closed");
+  });
+
+  it("does not auto-open the keyboard shortcut dialog on touch-only devices", () => {
+    localStorage.removeItem("has-seen-keyboard-shortcuts");
+    window.matchMedia = createMatchMedia({
+      "(min-width: 1024px)": true,
+      "(any-hover: hover)": false,
+      "(any-pointer: fine)": false,
+    }) as unknown as typeof window.matchMedia;
+
+    const maxTouchPointsDescriptor = Object.getOwnPropertyDescriptor(
+      Navigator.prototype,
+      "maxTouchPoints",
+    );
+    Object.defineProperty(Navigator.prototype, "maxTouchPoints", {
+      configurable: true,
+      get: () => 5,
+    });
+
+    try {
+      render(
+        <MemoryRouter initialEntries={["/jobs/ready"]}>
+          <Routes>
+            <Route path="/jobs/:tab" element={<OrchestratorPage />} />
+            <Route path="/jobs/:tab/:jobId" element={<OrchestratorPage />} />
+          </Routes>
+        </MemoryRouter>,
+      );
+
+      expect(screen.getByTestId("help-dialog")).toHaveTextContent("closed");
+    } finally {
+      if (maxTouchPointsDescriptor) {
+        Object.defineProperty(
+          Navigator.prototype,
+          "maxTouchPoints",
+          maxTouchPointsDescriptor,
+        );
+      } else {
+        Reflect.deleteProperty(Navigator.prototype, "maxTouchPoints");
+      }
+    }
   });
 
   it("disables other shortcuts while help dialog is open", async () => {
